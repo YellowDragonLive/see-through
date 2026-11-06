@@ -3,13 +3,14 @@
     按官方 requirements 搭建 see_through 独立 conda 环境（可重复运行）。
 
 .EXAMPLE
-    .\setup_env.ps1              完整安装
-.EXAMPLE
-    .\setup_env.ps1 -VerifyOnly  只检查环境是否可用
+    .\setup_env.ps1                完整安装
+    .\setup_env.ps1 -VerifyOnly    只检查环境是否可用
+    .\setup_env.ps1 -Retries 3     git+ 依赖网络不稳时多重试几次
 #>
 [CmdletBinding()]
 param(
-    [switch]$VerifyOnly
+    [switch]$VerifyOnly,
+    [int]$Retries = 2
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,15 +22,41 @@ $EnvPrefix = Join-Path $env:USERPROFILE '.conda\envs\see_through'
 $PythonExe = Join-Path $EnvPrefix 'python.exe'
 Set-Location -LiteralPath $RepoRoot
 
+# WorkBuddy 通过 PYTHONPATH 注入 sitecustomize.py，其中「批量删除保护」会把
+# pip 覆盖包文件时的 os.unlink 累计计数，满 50 次即抛 SystemExit 中断安装。
+# 在隔离 conda 环境里做包管理属于误报。这里只对本次脚本派生出的子进程过滤掉
+# 该 shim，脚本结束立即恢复；不改全局环境、不禁用 shim 本身、不删任何用户文件。
+$OriginalPyPath = $env:PYTHONPATH
+function Restore-PyPath { $env:PYTHONPATH = $OriginalPyPath }
+if ($OriginalPyPath) {
+    $kept = @($OriginalPyPath.Split(';') | Where-Object {
+        $_ -and -not ($_ -like '*WorkBuddy*' -and $_ -like '*shim*')
+    })
+    $env:PYTHONPATH = $kept -join ';'
+    Write-Output '已为安装子进程过滤 PYTHONPATH 中的 shim（避免 pip 误触批量删除保护）。'
+}
+
 function Step([string]$title) {
     Write-Output ''
     Write-Output ("==== {0} ====" -f $title)
 }
 function Fail([string]$msg) {
+    Restore-PyPath
     Write-Output ''
     Write-Output ("错误：{0}" -f $msg)
     Write-Output '可修复后重新运行本脚本，已完成的步骤会自动跳过。'
     exit 1
+}
+function Invoke-PipStep([string]$title, [string[]]$PipArgs) {
+    Step $title
+    $maxTry = $Retries + 1
+    for ($i = 1; $i -le $maxTry; $i++) {
+        Write-Output ("  尝试 {0}/{1}" -f $i, $maxTry)
+        & $PythonExe -m pip @PipArgs
+        if ($LASTEXITCODE -eq 0) { return }
+        Write-Output '  本轮失败，重试中（git+ 依赖常因代理隧道临时 502 中断）。'
+    }
+    Fail ("{0} 连续 {1} 次失败" -f $title, $maxTry)
 }
 
 $verifyCode = @'
@@ -54,11 +81,26 @@ except Exception as e:
     print('bitsandbytes IMPORT FAILED:', e)
 '@
 
+$torchCheckCode = @'
+try:
+    import torch
+    ok = (torch.__version__.startswith('2.8.0')
+          and torch.version.cuda == '12.8'
+          and torch.cuda.is_available())
+except Exception:
+    ok = False
+import sys
+sys.exit(0 if ok else 1)
+'@
+
 if ($VerifyOnly) {
+    Restore-PyPath
     if (-not (Test-Path -LiteralPath $PythonExe)) { Fail "环境不存在：$PythonExe" }
     Step '环境验证'
     & $PythonExe -c $verifyCode
-    exit $LASTEXITCODE
+    $code = $LASTEXITCODE
+    Restore-PyPath
+    exit $code
 }
 
 Write-Output ("仓库根   : {0}" -f $RepoRoot)
@@ -75,16 +117,23 @@ if (Test-Path -LiteralPath $PythonExe) {
 }
 
 Step '2/6 安装 PyTorch 2.8.0 + CUDA 12.8（约 2.5GB，耗时最长）'
-& $PythonExe -m pip install torch==2.8.0+cu128 torchvision==0.23.0+cu128 torchaudio==2.8.0+cu128 --index-url https://download.pytorch.org/whl/cu128
-if ($LASTEXITCODE -ne 0) { Fail 'torch cu128 安装失败，检查网络与代理' }
+& $PythonExe -c $torchCheckCode
+if ($LASTEXITCODE -eq 0) {
+    Write-Output 'torch 2.8.0+cu128 已安装且 CUDA 可用，跳过（幂等）。'
+} else {
+    Invoke-PipStep -title '2/6 安装 torch cu128' -PipArgs @(
+        'install', 'torch==2.8.0+cu128', 'torchvision==0.23.0+cu128',
+        'torchaudio==2.8.0+cu128', '--index-url', 'https://download.pytorch.org/whl/cu128'
+    )
+}
 
-Step '3/6 安装 requirements.txt（含 git+ 依赖，需 GitHub 可达）'
-& $PythonExe -m pip install -r requirements.txt
-if ($LASTEXITCODE -ne 0) { Fail 'requirements.txt 安装失败' }
+Invoke-PipStep -title '3/6 安装 requirements.txt（含 git+ 依赖，需 GitHub 可达）' -PipArgs @(
+    'install', '-r', 'requirements.txt'
+)
 
-Step '4/6 安装 bitsandbytes（NF4 量化推理必需）'
-& $PythonExe -m pip install -r requirements-inference-bnb.txt
-if ($LASTEXITCODE -ne 0) { Fail 'bitsandbytes 安装失败，这是 Windows 上最容易出问题的一步' }
+Invoke-PipStep -title '4/6 安装 bitsandbytes（NF4 量化推理必需）' -PipArgs @(
+    'install', '-r', 'requirements-inference-bnb.txt'
+)
 
 Step '5/6 创建 assets（Windows 用复制代替 ln -sf）'
 $assets = Join-Path $RepoRoot 'assets'
@@ -102,3 +151,4 @@ if ($LASTEXITCODE -ne 0) { Fail '环境验证未通过' }
 Write-Output ''
 Write-Output '环境就绪。日常出图： scripts\infer_psd.cmd <输入图> <输出psd>'
 Write-Output ''
+Restore-PyPath

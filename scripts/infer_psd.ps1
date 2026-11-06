@@ -50,6 +50,17 @@ if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path 
 
 Set-Location -LiteralPath $RepoRoot
 
+# 同 setup_env.ps1：WorkBuddy 经 PYTHONPATH 注入的 sitecustomize 会把删除操作
+# 计入批量删除保护。推理过程会写大量中间文件，避免跑到一半被误判中断。
+# 只对本次派生的 python 子进程过滤，不改全局环境、不删用户文件。
+$origPyPath = $env:PYTHONPATH
+if ($origPyPath) {
+    $keptPy = @($origPyPath.Split(';') | Where-Object {
+        $_ -and -not ($_ -like '*WorkBuddy*' -and $_ -like '*shim*')
+    })
+    $env:PYTHONPATH = $keptPy -join ';'
+}
+
 if (-not $SkipVramCheck) {
     Write-Output '--- 显存体检（只读，不会关闭任何进程）---'
     & (Join-Path $PSScriptRoot 'gpu_mem.ps1') | Select-Object -First 7

@@ -11,12 +11,14 @@
 param(
     [Parameter(Position=0, Mandatory=$true)][string]$InputImage,
     [Parameter(Position=1, Mandatory=$true)][string]$OutputPsd,
-    [int]$Resolution = 1024,
+    [int]$Resolution = 768,
     [int]$DepthResolution = 720,
     [int]$Steps = 30,
     [int]$Seed = 42,
     [switch]$CpuOffload,
+    [switch]$GroupOffload,
     [switch]$SkipVramCheck,
+    [switch]$Offline,
     [switch]$CleanOutput
 )
 
@@ -80,7 +82,16 @@ $psdRel    = "workspace/runs/$tag/$rawStem.psd"
 $runsRoot  = Join-Path $RepoRoot 'workspace\runs'
 if (-not (Test-Path -LiteralPath $runsRoot)) { New-Item -ItemType Directory -Path $runsRoot -Force | Out-Null }
 
-$env:PYTORCH_CUDA_ALLOC_CONF = 'expandable_segments:True'
+# Windows 不支持 expandable_segments，避免留下一个无效且会触发告警的配置。
+$env:PYTORCH_CUDA_ALLOC_CONF = ''
+# 8GB 卡实测：官方默认开启的 group_offload 会把 NF4 权重搬到 CPU，
+# bitsandbytes 再取回时 cuBLAS 上下文崩溃（CUBLAS_STATUS_ALLOC_FAILED）。
+# 关闭后 tag 编码一次通过，且峰值显存仍在 4GB 以内，因此默认关闭。
+# -Offline 用于模型已缓存但代理抖动（HF 返回 502）时跳过联网校验。
+if ($Offline) {
+    $env:HF_HUB_OFFLINE = '1'
+    $env:TRANSFORMERS_OFFLINE = '1'
+}
 
 $pyArgs = @(
     'inference/scripts/inference_psd_quantized.py',
@@ -93,13 +104,15 @@ $pyArgs = @(
     '--seed', "$Seed"
 )
 if ($CpuOffload) { $pyArgs += '--cpu_offload' }
+if (-not $GroupOffload) { $pyArgs += '--no_group_offload' }
 
 Write-Output '--- 开始推理（纯 CLI，无 webui）---'
 Write-Output ("  输入      : {0}" -f $InputImage)
 Write-Output ("  输出      : {0}" -f $outFull)
 Write-Output ("  分辨率    : {0} / depth {1}" -f $Resolution, $DepthResolution)
 Write-Output ("  CPU offload: {0}" -f $(if ($CpuOffload) { '开' } else { '关' }))
-Write-Output ("  group offload: 开（源码默认）")
+Write-Output ("  group offload: {0}" -f $(if ($GroupOffload) { '开' } else { '关（8GB 卡默认）' }))
+Write-Output ("  离线模式  : {0}" -f $(if ($Offline) { '开' } else { '关' }))
 Write-Output ''
 
 $startTime = Get-Date
@@ -108,7 +121,7 @@ $sw = [Diagnostics.Stopwatch]::StartNew()
 $code = $LASTEXITCODE
 $sw.Stop()
 if ($code -ne 0) {
-    Fail "推理退出码 $code。常见原因：显存不足。试试 -Resolution 768 或加 -CpuOffload。"
+    Fail "推理退出码 $code。先试 -Resolution 512；8GB 卡不要开 -GroupOffload / -CpuOffload。"
 }
 
 $produced = Join-Path $RepoRoot $psdRel

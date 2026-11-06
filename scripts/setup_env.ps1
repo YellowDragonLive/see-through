@@ -52,52 +52,31 @@ function Invoke-PipStep([string]$title, [string[]]$PipArgs) {
     $maxTry = $Retries + 1
     for ($i = 1; $i -le $maxTry; $i++) {
         Write-Output ("  尝试 {0}/{1}" -f $i, $maxTry)
+        # 5.1 下 Stop 会把 pip 的 stderr 当成终止错误，临时降级。
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
         & $PythonExe -m pip @PipArgs
-        if ($LASTEXITCODE -eq 0) { return }
+        $pipExit = $LASTEXITCODE
+        $ErrorActionPreference = $prevEap
+        if ($pipExit -eq 0) { return }
         Write-Output '  本轮失败，重试中（git+ 依赖常因代理隧道临时 502 中断）。'
     }
     Fail ("{0} 连续 {1} 次失败" -f $title, $maxTry)
 }
 
-$verifyCode = @'
-import sys
-print('python', sys.version.split()[0])
-import torch
-print('torch', torch.__version__)
-print('cuda_build', torch.version.cuda)
-print('cuda_available', torch.cuda.is_available())
-if torch.cuda.is_available():
-    print('device', torch.cuda.get_device_name(0))
-for name in ('transformers', 'diffusers', 'accelerate', 'psd_tools'):
-    try:
-        mod = __import__(name)
-        print(name, getattr(mod, '__version__', 'ok'))
-    except Exception as e:
-        print(name, 'IMPORT FAILED:', e)
-try:
-    import bitsandbytes as bnb
-    print('bitsandbytes', bnb.__version__)
-except Exception as e:
-    print('bitsandbytes IMPORT FAILED:', e)
-'@
-
-$torchCheckCode = @'
-try:
-    import torch
-    ok = (torch.__version__.startswith('2.8.0')
-          and torch.version.cuda == '12.8'
-          and torch.cuda.is_available())
-except Exception:
-    ok = False
-import sys
-sys.exit(0 if ok else 1)
-'@
+# 不用 python -c 传多行代码：Windows PowerShell 5.1 会吃掉参数里的双引号。
+# 所有内嵌 Python 都放在 scripts\py\ 下，用文件路径调用。
+$VerifyScript = Join-Path $PSScriptRoot 'py\verify_env.py'
+$TorchScript  = Join-Path $PSScriptRoot 'py\check_torch.py'
+foreach ($f in @($VerifyScript, $TorchScript)) {
+    if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { Fail "缺少脚本：$f" }
+}
 
 if ($VerifyOnly) {
     Restore-PyPath
     if (-not (Test-Path -LiteralPath $PythonExe)) { Fail "环境不存在：$PythonExe" }
     Step '环境验证'
-    & $PythonExe -c $verifyCode
+    & $PythonExe $VerifyScript
     $code = $LASTEXITCODE
     Restore-PyPath
     exit $code
@@ -117,7 +96,7 @@ if (Test-Path -LiteralPath $PythonExe) {
 }
 
 Step '2/6 安装 PyTorch 2.8.0 + CUDA 12.8（约 2.5GB，耗时最长）'
-& $PythonExe -c $torchCheckCode
+& $PythonExe $TorchScript
 if ($LASTEXITCODE -eq 0) {
     Write-Output 'torch 2.8.0+cu128 已安装且 CUDA 可用，跳过（幂等）。'
 } else {
@@ -145,7 +124,7 @@ if (Test-Path -LiteralPath $assets) {
 }
 
 Step '6/6 验证环境'
-& $PythonExe -c $verifyCode
+& $PythonExe $VerifyScript
 if ($LASTEXITCODE -ne 0) { Fail '环境验证未通过' }
 
 Write-Output ''

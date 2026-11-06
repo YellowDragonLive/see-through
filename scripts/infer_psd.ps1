@@ -19,7 +19,8 @@ param(
     [switch]$GroupOffload,
     [switch]$SkipVramCheck,
     [switch]$Offline,
-    [switch]$CleanOutput
+    [switch]$CleanOutput,
+    [switch]$CheckOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -63,29 +64,29 @@ if ($origPyPath) {
     $env:PYTHONPATH = $keptPy -join ';'
 }
 
-$checkCode = @'
-import sys
-from huggingface_hub import snapshot_download
-REPOS = [
-    "24yearsold/seethroughv0.0.2_layerdiff3d_nf4",
-    "24yearsold/seethroughv0.0.1_marigold_nf4",
-]
-missing = []
-for repo in REPOS:
-    try:
-        snapshot_download(repo_id=repo, local_files_only=True)
-    except Exception:
-        missing.append(repo)
-if missing:
-    print("MISSING: " + ", ".join(missing))
-    sys.exit(1)
-print("CACHE OK")
-'@
+$checkScript = Join-Path $PSScriptRoot 'py\check_cache.py'
+# 不用 python -c 传多行代码：Windows PowerShell 5.1 会把参数里的双引号吃掉，
+# 导致 Python 收到残缺代码（File "<string>", line 4）。统一改为独立 .py 文件。
 if ($Offline) {
-    $check = & $PythonExe -c $checkCode 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    if (-not (Test-Path -LiteralPath $checkScript -PathType Leaf)) { Fail "缺少缓存校验脚本：$checkScript" }
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $check = & $PythonExe $checkScript 2>&1
+    $cacheExit = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+    if ($cacheExit -ne 0) {
         Fail "-Offline 要求两个 NF4 模型都已缓存；当前缺失：$($check -join ' ')。请先运行 scripts\prefetch_models.cmd"
     }
+}
+
+if ($CheckOnly) {
+    Write-Output ''
+    Write-Output '--- 自检通过（未启动推理）---'
+    Write-Output ("  Python    : {0}" -f $PythonExe)
+    Write-Output ("  输入图片  : {0}" -f $InputImage)
+    Write-Output ("  离线缓存  : {0}" -f $(if ($Offline) { '已校验' } else { '未校验（未加 -Offline）' }))
+    Write-Output ("  分辨率    : {0}" -f $Resolution)
+    exit 0
 }
 
 if (-not $SkipVramCheck) {

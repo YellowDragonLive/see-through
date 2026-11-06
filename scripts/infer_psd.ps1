@@ -63,6 +63,31 @@ if ($origPyPath) {
     $env:PYTHONPATH = $keptPy -join ';'
 }
 
+$checkCode = @'
+import sys
+from huggingface_hub import snapshot_download
+REPOS = [
+    "24yearsold/seethroughv0.0.2_layerdiff3d_nf4",
+    "24yearsold/seethroughv0.0.1_marigold_nf4",
+]
+missing = []
+for repo in REPOS:
+    try:
+        snapshot_download(repo_id=repo, local_files_only=True)
+    except Exception:
+        missing.append(repo)
+if missing:
+    print("MISSING: " + ", ".join(missing))
+    sys.exit(1)
+print("CACHE OK")
+'@
+if ($Offline) {
+    $check = & $PythonExe -c $checkCode 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Fail "-Offline 要求两个 NF4 模型都已缓存；当前缺失：$($check -join ' ')。请先运行 scripts\prefetch_models.cmd"
+    }
+}
+
 if (-not $SkipVramCheck) {
     Write-Output '--- 显存体检（只读，不会关闭任何进程）---'
     & (Join-Path $PSScriptRoot 'gpu_mem.ps1') | Select-Object -First 7

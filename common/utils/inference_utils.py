@@ -6,7 +6,7 @@ from modules.layerdiffuse.diffusers_kdiffusion_sdxl import KDiffusionStableDiffu
 from modules.layerdiffuse.vae import TransparentVAE
 from modules.layerdiffuse.layerdiff3d import UNetFrameConditionModel
 from modules.marigold import MarigoldDepthPipeline
-from utils.cv import center_square_pad_resize, img_alpha_blending, smart_resize, validate_resolution
+from utils.cv import center_square_pad_resize, img_alpha_blending, pad_rgb, smart_resize, validate_resolution
 from utils.torch_utils import seed_everything
 from utils.io_utils import json2dict, dict2json, load_parts, save_tmp_img, load_part, save_psd
 from utils.torchcv import cluster_inpaint_part
@@ -141,13 +141,39 @@ def apply_layerdiff(
         # head_img = np.array(Image.open(osp.join(saved, 'head.png')))
 
         head_tag_list = ['headwear', 'face', 'irides', 'eyebrow', 'eyewhite', 'eyelash', 'eyewear', 'ears', 'earwear', 'nose', 'mouth']
-        hx0, hy0, hw, hh = cv2.boundingRect(cv2.findNonZero((head_img[..., -1] > 15).astype(np.uint8)))
+        head_mask = (head_img[..., -1] > 15).astype(np.uint8)
+        if not np.any(head_mask):
+            raise ValueError(
+                'Cannot extract head layers: generated head mask is empty '
+                f'(head image shape={head_img.shape}, source image shape={input_img.shape}, '
+                f'output directory={saved}).'
+            )
+
+        hx0, hy0, hw, hh = cv2.boundingRect(cv2.findNonZero(head_mask))
         
         hx = int(hx0 * scale) - pad_pos[0]
         hy = int(hy0 * scale) - pad_pos[1]
         hw = int(hw * scale)
         hh = int(hh * scale)
-        input_head, (hx1, hy1, hx2, hy2) = _crop_head(input_img, [hx, hy, hw, hh])
+        src_h, src_w = input_img.shape[:2]
+        hx2 = min(hx + hw, src_w)
+        hy2 = min(hy + hh, src_h)
+        hx = max(hx, 0)
+        hy = max(hy, 0)
+        if hx2 <= hx or hy2 <= hy:
+            raise ValueError(
+                'Cannot extract head layers: generated head bounding box does not intersect '
+                f'the source image (bbox={(hx, hy, hx2, hy2)}, '
+                f'source image size={(src_w, src_h)}, output directory={saved}).'
+            )
+
+        input_head, (hx1, hy1, hx2, hy2) = _crop_head(input_img, [hx, hy, hx2 - hx, hy2 - hy])
+        if input_head.size == 0 or input_head.shape[0] == 0 or input_head.shape[1] == 0:
+            raise ValueError(
+                'Cannot extract head layers: clipped head crop is empty '
+                f'(bbox={(hx1, hy1, hx2, hy2)}, source image size={(src_w, src_h)}, '
+                f'output directory={saved}).'
+            )
         hx1 = int(hx1 / scale + pad_pos[0] / scale)
         hy1 = int(hy1 / scale + pad_pos[1] / scale)
         ih, iw = input_head.shape[:2]
@@ -433,6 +459,445 @@ def tag_lr_split(tag: str, tag2pinfo):
         tag2pinfo.update(part_lr_split(tag, part_info))
 
 
+
+
+# ==============================================================================
+# Plan C: Source-level CV Pipeline (Guided Filter Seam, Underlap Inpaint,
+#         Ground-Truth src_img Residual Sorting, Edge Decontamination,
+#         Mouth Halo Trim & Eyelash Skin-Fringe Cleanup)
+# ==============================================================================
+
+def _norm_part_role(tag: str) -> str:
+    s = tag.strip().lower().replace('_', ' ').replace('-', ' ')
+    parts = s.split()
+    if len(parts) >= 2 and (parts[-1].isdigit() or parts[-1] in ('l', 'r')):
+        s = ' '.join(parts[:-1])
+    return s
+
+
+def _part_to_full_canvas(pdict, H: int, W: int):
+    x1, y1, x2, y2 = [int(v) for v in pdict['xyxy']]
+    img = pdict['img']
+    dep = pdict['depth']
+    dep_f = (dep.astype(np.float32) / 255.0) if dep.dtype == np.uint8 else dep.astype(np.float32)
+    full_img = np.zeros((H, W, 4), dtype=np.uint8)
+    full_dep = np.ones((H, W), dtype=np.float32)
+    lh, lw = img.shape[:2]
+    cx1, cy1 = max(0, x1), max(0, y1)
+    cx2, cy2 = min(W, x1 + lw), min(H, y1 + lh)
+    if cx2 > cx1 and cy2 > cy1:
+        full_img[cy1:cy2, cx1:cx2] = img[cy1 - y1:cy2 - y1, cx1 - x1:cx2 - x1]
+        full_dep[cy1:cy2, cx1:cx2] = dep_f[cy1 - y1:cy2 - y1, cx1 - x1:cx2 - x1]
+    return full_img, full_dep
+
+
+def _guided_filter_mask(guide_rgb: np.ndarray, mask_f: np.ndarray, radius: int = 6, eps: float = 1e-3) -> np.ndarray:
+    """Fast pure-OpenCV Guided Filter (He et al.): snaps coarse depth cut masks to crisp RGB ink edges."""
+    I = cv2.cvtColor(guide_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    p = mask_f.astype(np.float32)
+    ksize = (2 * radius + 1, 2 * radius + 1)
+    mean_I = cv2.boxFilter(I, cv2.CV_32F, ksize)
+    mean_p = cv2.boxFilter(p, cv2.CV_32F, ksize)
+    corr_I = cv2.boxFilter(I * I, cv2.CV_32F, ksize)
+    corr_Ip = cv2.boxFilter(I * p, cv2.CV_32F, ksize)
+    var_I = np.maximum(corr_I - mean_I * mean_I, 0.0)
+    cov_Ip = corr_Ip - mean_I * mean_p
+    a = cov_Ip / (var_I + eps)
+    b = mean_p - a * mean_I
+    mean_a = cv2.boxFilter(a, cv2.CV_32F, ksize)
+    mean_b = cv2.boxFilter(b, cv2.CV_32F, ksize)
+    q = np.clip(mean_a * I + mean_b, 0.0, 1.0)
+    return q
+
+
+def _extend_back_underlap(
+    full_img: np.ndarray,
+    back_alpha_scale: np.ndarray,
+    front_bin: np.ndarray,
+    seam_px: int = 8,
+    use_lama: bool = False,
+) -> tuple:
+    """Extend the back sub-layer slightly underneath the front cut seam and inpaint RGB
+    so 2.5D swaying/turning never exposes a transparent crack between front & back sub-layers."""
+    orig_a = full_img[..., 3]
+    back_img = full_img.copy()
+    back_a = np.clip(np.round(orig_a.astype(np.float32) * back_alpha_scale), 0, 255).astype(np.uint8)
+    back_solid = back_a > 128
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * seam_px + 1, 2 * seam_px + 1))
+    # Dilate back_solid into front_bin (only inside original layer silhouette) to create an underlap lip
+    underlap = (cv2.dilate(back_solid.astype(np.uint8), k) > 0) & front_bin & (orig_a > 24) & (~back_solid)
+    if int(underlap.sum()) < 16:
+        back_img[..., 3] = back_a
+        return back_img
+
+    # Crop to bounding box of (back_solid | underlap) for fast local inpainting
+    union = back_solid | underlap
+    ys, xs = np.nonzero(union)
+    y1, y2 = max(0, int(ys.min()) - 4), min(full_img.shape[0], int(ys.max()) + 5)
+    x1, x2 = max(0, int(xs.min()) - 4), min(full_img.shape[1], int(xs.max()) + 5)
+    rgb_crop = full_img[y1:y2, x1:x2, :3].copy()
+    hole_crop = (underlap[y1:y2, x1:x2].astype(np.uint8)) * 255
+
+    inpainted_rgb = None
+    if use_lama:
+        try:
+            from annotators.lama_inpainter import apply_inpaint
+            inpainted_rgb = apply_inpaint(rgb_crop, hole_crop > 0)
+        except Exception:
+            inpainted_rgb = None
+    if inpainted_rgb is None:
+        inpainted_rgb = cv2.inpaint(rgb_crop, hole_crop, inpaintRadius=max(3, seam_px // 2), flags=cv2.INPAINT_TELEA)
+
+    back_img[y1:y2, x1:x2, :3] = np.where(hole_crop[..., None] > 0, inpainted_rgb, rgb_crop)
+    # Softly fade the underlap alpha so it stays cleanly tucked behind the front sub-layer
+    under_soft = cv2.GaussianBlur(underlap.astype(np.float32), (0, 0), 1.5)
+    ext_a = np.clip(np.round(orig_a.astype(np.float32) * np.clip(back_alpha_scale + under_soft * 0.95, 0.0, 1.0)), 0, 255).astype(np.uint8)
+    back_img[..., 3] = np.maximum(back_a, ext_a)
+    return back_img
+
+
+def _make_split_part_from_rgba(tag: str, full_rgba: np.ndarray, full_dep: np.ndarray):
+    mask = full_rgba[..., 3] > 10
+    if not np.any(mask):
+        return None
+    ys, xs = np.nonzero(mask)
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    sub_crop = full_rgba[y1:y2, x1:x2].copy()
+    dep_crop = full_dep[y1:y2, x1:x2].copy()
+    m_crop = sub_crop[..., 3] > 10
+    return {
+        'tag': tag,
+        'img': sub_crop,
+        'depth': dep_crop,
+        'mask': m_crop,
+        'xyxy': [x1, y1, x2, y2],
+        'depth_median': float(np.median(dep_crop[m_crop])),
+    }
+
+
+def _decontaminate_edges(img: np.ndarray) -> np.ndarray:
+    """Remove dark/background color bleeding on semi-transparent fringes using alpha-pyramid RGB padding."""
+    if img is None or img.size == 0 or img.shape[2] != 4:
+        return img
+    a = img[..., 3]
+    if not np.any((a > 0) & (a < 230)) or not np.any(a >= 230):
+        return img
+    try:
+        # Build clean RGB from opaque core pixels (a >= 180) and apply only to semi-transparent fringe
+        core = img.copy()
+        core[..., 3] = np.where(a >= 180, a, 0)
+        padded_rgb = pad_rgb(core, return_format='rgb', to_uint8=True, keep_ori_pixel=True)
+        out = img.copy()
+        fringe = (a > 0) & (a < 180)
+        out[fringe, :3] = padded_rgb[fringe]
+        return out
+    except Exception:
+        return img
+
+
+def _depth_split_bimodal_parts(tag2pinfo: dict, frame_size, use_lama: bool = False):
+    """Split handwear (disconnected & connected arms) and back hair along depth cliffs vs topwear,
+    using RGB Guided Filter edge snapping + back-layer underlap inpainting."""
+    H, W = int(frame_size[0]), int(frame_size[1])
+    if 'topwear' not in tag2pinfo:
+        return
+    tw_img, tw_dep = _part_to_full_canvas(tag2pinfo['topwear'], H, W)
+    tw_m = tw_img[..., 3] > 32
+    tw_med = float(tag2pinfo['topwear'].get('depth_median', np.median(tw_dep[tw_m]) if np.any(tw_m) else 0.7))
+
+    # 1. Split `handwear` into `handwear_1` (behind topwear) + `handwear_2` (in front of topwear)
+    if 'handwear' in tag2pinfo:
+        hw = tag2pinfo['handwear']
+        hw_img, hw_dep = _part_to_full_canvas(hw, H, W)
+        hw_m = hw_img[..., 3] > 24
+        n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(hw_m.astype(np.uint8), connectivity=4)
+        front_c, back_c = [], []
+        for cid in range(1, n_lbl):
+            if stats[cid, cv2.CC_STAT_AREA] < 200:
+                continue
+            ov = (labels == cid) & tw_m
+            ov_n = int(ov.sum())
+            if ov_n < 80:
+                continue
+            diff = hw_dep[ov] - tw_dep[ov]
+            fn, bn = int((diff < -0.02).sum()), int((diff > 0.02).sum())
+            if fn > ov_n * 0.55 and fn > bn * 2:
+                front_c.append(cid)
+            elif bn > ov_n * 0.55 and bn > fn * 2:
+                back_c.append(cid)
+
+        back_mask, front_mask, connected_split = None, None, False
+        if front_c and back_c:
+            back_mask = np.isin(labels, back_c)
+            front_mask = (hw_img[..., 3] > 0) & (~back_mask)
+        else:
+            # Connected/touching arms (e.g. both hands holding an object in 1 component)
+            ov = hw_m & tw_m
+            ov_n = int(ov.sum())
+            if ov_n >= 8000:
+                diff = hw_dep - tw_dep
+                f_ov = ov & (diff < -0.025)
+                b_ov = ov & (diff > 0.025)
+                fn, bn = int(f_ov.sum()), int(b_ov.sum())
+                if fn >= 4000 and bn >= 4000 and (fn / ov_n) >= 0.18 and (bn / ov_n) >= 0.15:
+                    med_f, med_b = float(np.median(hw_dep[f_ov])), float(np.median(hw_dep[b_ov]))
+                    if abs(med_b - med_f) >= 0.15:
+                        thresh = 0.5 * (med_f + med_b)
+                        raw_b = ((hw_m & (hw_dep > thresh)) | b_ov) & (~f_ov)
+                        nb, blab, bstats, _ = cv2.connectedComponentsWithStats(raw_b.astype(np.uint8), connectivity=4)
+                        clean_b = np.isin(blab, [c for c in range(1, nb) if bstats[c, cv2.CC_STAT_AREA] >= 1500])
+                        nf, flab, fstats, _ = cv2.connectedComponentsWithStats((hw_m & (~clean_b)).astype(np.uint8), connectivity=4)
+                        clean_f = np.isin(flab, [c for c in range(1, nf) if fstats[c, cv2.CC_STAT_AREA] >= 1500])
+                        clean_b = hw_m & (~clean_f)
+                        if int(clean_b.sum()) >= 3000 and int(clean_f.sum()) >= 3000:
+                            back_mask, front_mask, connected_split = clean_b, clean_f, True
+
+        if back_mask is not None and front_mask is not None:
+            if connected_split:
+                # Snap cut seam to crisp RGB ink edges via Guided Filter + underlap inpaint on back arm
+                soft_f = _guided_filter_mask(hw_img[..., :3], front_mask.astype(np.float32), radius=5, eps=1e-3)
+                front_rgba = hw_img.copy()
+                front_rgba[..., 3] = np.clip(np.round(hw_img[..., 3].astype(np.float32) * soft_f), 0, 255).astype(np.uint8)
+                back_rgba = _extend_back_underlap(hw_img, 1.0 - soft_f, front_mask, seam_px=8, use_lama=use_lama)
+            else:
+                front_rgba = hw_img.copy()
+                front_rgba[~front_mask, 3] = 0
+                back_rgba = hw_img.copy()
+                back_rgba[~back_mask, 3] = 0
+            p_back = _make_split_part_from_rgba('handwear_1', back_rgba, hw_dep)
+            p_front = _make_split_part_from_rgba('handwear_2', front_rgba, hw_dep)
+            if p_back is not None and p_front is not None:
+                p_back['depth_median'] = max(p_back['depth_median'], tw_med + 0.01)
+                p_front['depth_median'] = min(p_front['depth_median'], tw_med - 0.01)
+                tag2pinfo.pop('handwear')
+                tag2pinfo['handwear_1'] = p_back
+                tag2pinfo['handwear_2'] = p_front
+
+    # 2. Split `back hair` when front-draped braids/locks sit in front of `topwear`
+    if 'back hair' in tag2pinfo:
+        bh = tag2pinfo['back hair']
+        bh_img, bh_dep = _part_to_full_canvas(bh, H, W)
+        bh_m = bh_img[..., 3] > 24
+        ov = bh_m & tw_m
+        ov_n = int(ov.sum())
+        if ov_n >= 4000:
+            diff = bh_dep - tw_dep
+            f_ov = ov & (diff < -0.025)
+            b_ov = ov & (diff > 0.025)
+            fn, bn = int(f_ov.sum()), int(b_ov.sum())
+            if fn >= 4000 and bn >= 4000 and (fn / ov_n) >= 0.22 and (bn / ov_n) >= 0.18:
+                thresh = 0.5 * (float(np.median(bh_dep[f_ov])) + float(np.median(bh_dep[b_ov])))
+                raw_f = ((bh_m & (bh_dep < thresh)) | f_ov) & (~b_ov)
+                nf, flab, fstats, _ = cv2.connectedComponentsWithStats(raw_f.astype(np.uint8), connectivity=4)
+                keep_f = [c for c in range(1, nf) if fstats[c, cv2.CC_STAT_AREA] >= 500]
+                if keep_f:
+                    clean_f = np.isin(flab, keep_f)
+                    soft_f = _guided_filter_mask(bh_img[..., :3], clean_f.astype(np.float32), radius=6, eps=1e-3)
+                    front_rgba = bh_img.copy()
+                    front_rgba[..., 3] = np.clip(np.round(bh_img[..., 3].astype(np.float32) * soft_f), 0, 255).astype(np.uint8)
+                    back_rgba = _extend_back_underlap(bh_img, 1.0 - soft_f, clean_f, seam_px=8, use_lama=use_lama)
+                    p_back_h = _make_split_part_from_rgba('back hair_1', back_rgba, bh_dep)
+                    p_front_h = _make_split_part_from_rgba('back hair_2', front_rgba, bh_dep)
+                    if p_back_h is not None and p_front_h is not None:
+                        p_back_h['depth_median'] = max(p_back_h['depth_median'], tw_med + 0.015)
+                        p_front_h['depth_median'] = min(p_front_h['depth_median'], tw_med - 0.015)
+                        if 'face' in tag2pinfo:
+                            p_front_h['depth_median'] = max(p_front_h['depth_median'], float(tag2pinfo['face']['depth_median']) + 0.002)
+                        tag2pinfo.pop('back hair')
+                        tag2pinfo['back hair_1'] = p_back_h
+                        tag2pinfo['back hair_2'] = p_front_h
+
+
+def _clean_mouth_layer(mouth_dict: dict):
+    """Strip isolated border bleed specks (e.g. nose shadow) and trim oversized skin-colored halo around mouth."""
+    img = mouth_dict.get('img')
+    if img is None or img.size == 0:
+        return
+    mh, mw = img.shape[:2]
+    border = np.zeros((mh, mw), dtype=bool)
+    border[0, :] = border[-1, :] = border[:, 0] = border[:, -1] = True
+    b_ok = border & (img[..., 3] > 200)
+    if int(b_ok.sum()) < 12:
+        return
+    skin = img[b_ok, :3].astype(np.float32).mean(axis=0) / 255.0
+    skin_lum = float(0.299 * skin[0] + 0.587 * skin[1] + 0.114 * skin[2])
+    rgb = img[..., :3].astype(np.float32) / 255.0
+    lum = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+    feat = (img[..., 3] > 48) & ((np.abs(rgb - skin).sum(axis=2) > 0.14) | ((skin_lum - lum) > 0.11))
+    if int(feat.sum()) < 16:
+        return
+
+    n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(feat.astype(np.uint8), connectivity=4)
+    if n_lbl <= 1:
+        return
+    areas = [int(stats[i, cv2.CC_STAT_AREA]) for i in range(n_lbl)]
+    main_c = 1 + int(np.argmax(areas[1:]))
+    ys_m = np.nonzero(labels == main_c)[0]
+    main_cy = float(ys_m.mean())
+    tol = max(10.0, float(ys_m.max() - ys_m.min() + 1) * 0.75)
+
+    keep = np.zeros((mh, mw), dtype=np.uint8)
+    for cid in range(1, n_lbl):
+        ys_c = np.nonzero(labels == cid)[0]
+        if cid == main_c or (areas[cid] >= max(6, areas[main_c] * 0.12) and abs(float(ys_c.mean()) - main_cy) <= tol):
+            keep[labels == cid] = 255
+
+    # Tightly trim giant skin halo while keeping a smooth 4px soft margin around actual mouth features
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    keep_closed = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, k_close)
+    k_dil = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    tight_halo = cv2.GaussianBlur(cv2.dilate(keep_closed, k_dil).astype(np.float32) / 255.0, (0, 0), 1.5)
+    img[..., 3] = np.clip(np.round(img[..., 3].astype(np.float32) * tight_halo), 0, 255).astype(np.uint8)
+
+
+def _clean_eyelash_skin_fringe(eyelash_dict: dict, face_dict: dict):
+    """Attenuate low-contrast skin-colored fringe pixels accidentally baked into eyelash alpha."""
+    img = eyelash_dict.get('img')
+    fimg = face_dict.get('img') if face_dict else None
+    if img is None or fimg is None or img.size == 0 or fimg.size == 0:
+        return
+    fm = fimg[..., 3] > 230
+    if int(fm.sum()) < 50:
+        return
+    skin = np.median(fimg[fm, :3].astype(np.float32), axis=0) / 255.0
+    rgb = img[..., :3].astype(np.float32) / 255.0
+    diff = np.abs(rgb - skin).sum(axis=2)
+    fringe_skin = (img[..., 3] > 0) & (img[..., 3] < 160) & (diff < 0.14)
+    if np.any(fringe_skin):
+        img[fringe_skin, 3] = (img[fringe_skin, 3].astype(np.float32) * 0.25).astype(np.uint8)
+
+
+def _sort_parts_by_local_overlap(part_dict_list: list, frame_size, fullpage=None):
+    """Ground-truth src_img residual verification + local overlap-region depth sorting,
+    with strict anatomical face/eye/garment invariants."""
+    H, W = int(frame_size[0]), int(frame_size[1])
+    arr = sorted(part_dict_list, key=lambda x: float(x.get('depth_median', 1.0)), reverse=True)
+    if not arr or 'img' not in arr[0] or 'depth' not in arr[0]:
+        return arr
+
+    full_rgb = {}
+    full_m = {}
+    full_d = {}
+    for p in arr:
+        fi, fd = _part_to_full_canvas(p, H, W)
+        full_rgb[p['tag']] = fi[..., :3].astype(np.float32)
+        full_m[p['tag']] = fi[..., 3] > 32
+        full_d[p['tag']] = fd
+
+    src_rgb = None
+    if fullpage is not None and fullpage.shape[0] == H and fullpage.shape[1] == W:
+        src_rgb = fullpage[..., :3].astype(np.float32)
+
+    # 1. Pairwise ordering: prefer ground-truth src_img residual in A ∩ B, fall back to local pixel depth
+    body_sortable = {
+        'back hair', 'neck', 'topwear', 'bottomwear', 'legwear', 'footwear',
+        'neckwear', 'handwear', 'headwear', 'objects', 'ears', 'earwear', 'tail', 'wings',
+    }
+    guard = len(arr) * len(arr)
+    changed = True
+    while changed and guard > 0:
+        guard -= 1
+        changed = False
+        for i in range(len(arr)):
+            for j in range(i + 1, len(arr)):
+                A, B = arr[i], arr[j]
+                rA, rB = _norm_part_role(A['tag']), _norm_part_role(B['tag'])
+                allow_pair = (rA in body_sortable and rB in body_sortable) or (
+                    'handwear' in (rA, rB) and ('face' in (rA, rB) or 'front hair' in (rA, rB))
+                )
+                if not allow_pair:
+                    continue
+                ov = full_m[A['tag']] & full_m[B['tag']]
+                if int(ov.sum()) < 40:
+                    continue
+                a_on_top = None
+                if src_rgb is not None:
+                    # Ground-truth check: which layer's RGB matches the original image src_img better inside A ∩ B?
+                    err_a = float(np.abs(full_rgb[A['tag']][ov] - src_rgb[ov]).mean())
+                    err_b = float(np.abs(full_rgb[B['tag']][ov] - src_rgb[ov]).mean())
+                    if abs(err_a - err_b) >= 6.0 and min(err_a, err_b) <= max(err_a, err_b) * 0.85:
+                        a_on_top = err_a < err_b
+                if a_on_top is None:
+                    ma = float(full_d[A['tag']][ov].mean())
+                    mb = float(full_d[B['tag']][ov].mean())
+                    if abs(ma - mb) >= 0.025:
+                        a_on_top = ma < mb
+                if a_on_top:
+                    arr.pop(i)
+                    arr.insert(j, A)
+                    changed = True
+                    break
+            if changed:
+                break
+
+    # 2. Enforce unambiguous garment order (legwear < bottomwear < topwear < neckwear)
+    garment_behind = {
+        'wings': {'back hair', 'neck', 'legwear', 'footwear', 'bottomwear', 'topwear', 'neckwear'},
+        'tail': {'back hair', 'neck', 'legwear', 'footwear', 'bottomwear', 'topwear', 'neckwear'},
+        'legwear': {'footwear', 'bottomwear'},
+        'footwear': {'bottomwear'},
+        'bottomwear': {'topwear'},
+        'topwear': {'neckwear'},
+    }
+    guard = len(arr) * len(arr)
+    changed = True
+    while changed and guard > 0:
+        guard -= 1
+        changed = False
+        for i in range(len(arr)):
+            for j in range(i + 1, len(arr)):
+                ra, rb = _norm_part_role(arr[i]['tag']), _norm_part_role(arr[j]['tag'])
+                if ra in garment_behind.get(rb, set()) and int((full_m[arr[i]['tag']] & full_m[arr[j]['tag']]).sum()) > 12:
+                    b = arr.pop(j)
+                    arr.insert(i, b)
+                    changed = True
+                    break
+            if changed:
+                break
+
+    # 3. Lock v3 anatomical face/eye stack: back hair/neck/ears < face < mouth/nose < eyewhite < irides < eyelash < front hair
+    face_rank = {
+        'facedetail': 1, 'nose': 1, 'mouth': 1,
+        'eyewhite': 2, 'irides': 3, 'eyelash': 4, 'eyebrow': 4, 'eyewear': 5,
+    }
+    above_face = {'front hair', 'side hair', 'ahoge'}
+    below_face = {'back hair', 'neck', 'ears'}
+    guard = len(arr) * len(arr)
+    changed = True
+    while changed and guard > 0:
+        guard -= 1
+        changed = False
+        for i in range(len(arr)):
+            for j in range(i + 1, len(arr)):
+                ra, rb = _norm_part_role(arr[i]['tag']), _norm_part_role(arr[j]['tag'])
+                need_swap = False
+                if rb == 'face' and (ra in face_rank or ra in above_face):
+                    need_swap = True
+                elif ra == 'face' and rb in below_face:
+                    need_swap = True
+                elif ra in face_rank and rb in face_rank and face_rank[ra] > face_rank[rb] and not (ra == 'eyebrow' or rb == 'eyebrow'):
+                    need_swap = True
+                if need_swap:
+                    if ra in above_face:
+                        a = arr.pop(i)
+                        last = max((k for k, x in enumerate(arr) if _norm_part_role(x['tag']) == 'face' or _norm_part_role(x['tag']) in face_rank), default=len(arr) - 1)
+                        arr.insert(last + 1, a)
+                    elif rb == 'face':
+                        a = arr.pop(i)
+                        arr.insert(j, a)
+                    else:
+                        b = arr.pop(j)
+                        arr.insert(i, b)
+                    changed = True
+                    break
+            if changed:
+                break
+
+    return arr
+
+
 def further_extr(srcd: str, rotate=True, save_to_psd=False, tblr_split=True):
 
 
@@ -510,6 +975,18 @@ def further_extr(srcd: str, rotate=True, save_to_psd=False, tblr_split=True):
     if 'mouth' in tag2pinfo:
         xyxy = tag2pinfo['mouth']['xyxy']
         tag2pinfo['mouth']['img'][..., :3] = fullpage[xyxy[1]: xyxy[3], xyxy[0]: xyxy[2], :3]
+        _clean_mouth_layer(tag2pinfo['mouth'])
+
+    if 'eyelash' in tag2pinfo and 'face' in tag2pinfo:
+        _clean_eyelash_skin_fringe(tag2pinfo['eyelash'], tag2pinfo['face'])
+
+    # Plan C: depth-cliff split (Guided Filter edge snapping + back-layer underlap inpaint)
+    _depth_split_bimodal_parts(tag2pinfo, fullpage.shape[:2])
+
+    # Plan C: edge RGB decontamination (eliminates dark/gray halos on transparent fringes)
+    for _pdict in tag2pinfo.values():
+        if 'img' in _pdict:
+            _pdict['img'] = _decontaminate_edges(_pdict['img'])
 
     part_dict_list = []
     save_dir = osp.dirname(saved)
@@ -525,10 +1002,12 @@ def further_extr(srcd: str, rotate=True, save_to_psd=False, tblr_split=True):
             part_dict_list.append(part_dict)
 
     if 'face' in tag2pinfo:
-        for t in ['nose', 'mouth', 'eyes']:
+        fd = float(tag2pinfo['face']['depth_median'])
+        for idx_t, t in enumerate(['nose', 'mouth', 'eyes', 'eyewhite', 'irides', 'eyelash', 'eyebrow']):
             if t in tag2pinfo:
-                if tag2pinfo[t]['depth_median'] > tag2pinfo['face']['depth_median']:
-                    tag2pinfo[t]['depth_median'] = tag2pinfo['face']['depth_median'] - 0.001
+                target_max = fd - 0.001 * (idx_t + 1)
+                if tag2pinfo[t]['depth_median'] > target_max:
+                    tag2pinfo[t]['depth_median'] = target_max
         for t in ['earr', 'earl', 'ears']:
             if t in tag2pinfo:
                 tag2pinfo[t]['depth_median'] = tag2pinfo['face']['depth_median'] + 0.001
@@ -539,19 +1018,19 @@ def further_extr(srcd: str, rotate=True, save_to_psd=False, tblr_split=True):
     frame_size = fullpage.shape[:2]
 
     if save_to_psd:
-        dump_parts_psd(tag2pinfo, frame_size, psd_savep, part_dict_list=part_dict_list)
+        dump_parts_psd(tag2pinfo, frame_size, psd_savep, part_dict_list=part_dict_list, fullpage=fullpage)
         print(f'psd saved to {psd_savep}')
     else:
         dict2json({'parts': tag2pinfo, 'frame_size': frame_size}, osp.join(saved, 'info.json'))
 
 
-def dump_parts_psd(tag2pinfo, frame_size, psd_savep, part_dict_list=None):
+def dump_parts_psd(tag2pinfo, frame_size, psd_savep, part_dict_list=None, fullpage=None):
     if part_dict_list is None:
         part_dict_list = []
         for v in tag2pinfo.values():
             part_dict_list.append(v)
     psd_depth_savep = osp.splitext(psd_savep)[0] + '_depth.psd'
-    part_dict_list.sort(key=lambda x: x['depth_median'], reverse=True)
+    part_dict_list = _sort_parts_by_local_overlap(part_dict_list, frame_size, fullpage=fullpage)
     save_psd(psd_savep, part_dict_list, frame_size[0], frame_size[1])
     save_psd(psd_depth_savep, part_dict_list, frame_size[0], frame_size[1], mode='L', img_key='depth')
     for pdict in tag2pinfo.values():

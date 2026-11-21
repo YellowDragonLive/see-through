@@ -1,0 +1,108 @@
+bash /mnt/x/ai_tool/see-through/workspace/batch.sh
+批处理脚本已固定下来
+脚本位于 batch.sh。目录就按你要求的三个：
+
+plaintext
+
+workspace/
+├─ batch.sh        ← 脚本
+├─ target/         ← 放目标图片
+├─ output/         ← 产物，每次开 output/20261119_170000/
+└─ log/            ← 运行情况
+用法只有一条命令：
+
+bash
+
+bash /mnt/x/ai_tool/see-through/workspace/batch.sh
+分辨率作为参数指定，默认 1024；8GB 显卡上最高只能用 1280：
+
+bash
+
+bash .../batch.sh 1280
+bash .../batch.sh 1024 --no-preview
+log/<时间戳>/ 里保存一次运行的完整记录：inputs/（ASCII 副本和 map.tsv 对照表）、每张图的 t01.log、metrics.csv 采样数据、report.md 资源报表、summary.txt 汇总。产物旁边还会自动生成 t01_preview.png，不用打开 PS 就能直接看图。
+
+因为脚本以自身所在目录为路径基准，所以即使把整个 workspace 目录移到别处也仍然能用。
+
+我做过端到端冒烟测试（用临时目录，没有改动你的正式文件夹）：一张 832×1248 的图跑 1024px，用时 6 分 10 秒，显存峰值 6.44 GiB（80%）​，温度 79°C，swap 全程为 0，报表和预览都正常。中文文件名会自动映射成 t01，不会写进 PSD 图层名。
+
+
+Loading weights: 100%|██████████| 372/372 [00:00<00:00, 2921.58it/s, Materializing param=text_model.final_layer_norm.weight]
+Loading pipeline components...: 100%|██████████| 4/4 [00:00<00:00, 15.94it/s]
+Running Marigold depth...
+100%|██████████| 4/4 [00:08<00:00,  2.10s/it]
+  Marigold done in 16.9s
+
+Running PSD assembly...
+Traceback (most recent call last):
+  File "/mnt/x/ai_tool/see-through/inference/scripts/inference_psd_quantized.py", line 432, in <module>
+    further_extr(saved, rotate=False, save_to_psd=args.save_to_psd, tblr_split=args.tblr_split)
+  File "/mnt/x/ai_tool/see-through/common/utils/inference_utils.py", line 1312, in further_extr
+    _fill_head_interior_gaps(tag2pinfo, fullpage.shape[:2])
+  File "/mnt/x/ai_tool/see-through/common/utils/inference_utils.py", line 812, in _fill_head_interior_gaps
+    updated['depth_median'] = tag2pinfo[bh_key]['depth_median']
+                              ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+KeyError: 'depth_median'
+[FAIL] t03 失败（rc=1 / 非显存错误 / 222s）→ log/20261121_185136/t03.log
+
+采样已停止：/mnt/x/ai_tool/see-through/workspace/log/20261121_185136/metrics.csv
+完整报表：bash /home/eric/report_metrics.sh /mnt/x/ai_tool/see-through/workspace/log/20261121_185136/metrics.csv
+--------------------------------------------------------------------
+[5/5] 生成预览与报表
+  运行时间：2026-11-21 19:03:05
+  分辨率：768px   图片数：3
+  总耗时：11 分 25 秒
+  
+  图片   耗时   状态 分项
+  t01      240s     FAIL(非显存错误) 
+  t02      223s     FAIL(非显存错误) 
+  t03      222s     FAIL(非显存错误) 
+## 一、总览（Windows 任务管理器同口径）
+
+| 指标 | 平均 | 峰值 | 在 Windows 上对应哪里看 |
+|---|---|---|---|
+| CPU 使用率 | 5% | 14% | 性能 → CPU → 利用率 |
+| 内存使用 | 4.12 GiB | 4.83 GiB | 性能 → 内存 → 使用中 |
+| 内存可用 | — | 最低 10.50 GiB | 性能 → 内存 → 可用 |
+| Swap / 换页 | 0.00 GiB | 0.00 GiB | 性能 → 内存 → 已提交 |
+| GPU 利用率 | 92% | 100% | 性能 → GPU → 3D / CUDA |
+| 显存占用 | 4.72 GiB | 5.07 GiB (63%) | 性能 → GPU → 专用 GPU 内存 |
+| GPU 温度 | — | 79 °C | 任务管理器看不到，用 HWiNFO64 |
+| 板卡功耗 | 178 W | 199 W | 同上 |
+
+## 二、时间线（12 段均值，每段约 57 秒）
+
+```
+段  CPU     内存   内存占用           GPU    显存(/8G)         
+1    5%      3.58G    ####..............     62%    #######.........    
+2    4%      4.12G    #####.............     100%   ##########......    
+3    5%      4.18G    #####.............     97%    ##########......    
+4    5%      4.26G    #####.............     93%    ##########......    
+5    5%      4.08G    #####.............     84%    #########.......    
+6    4%      4.07G    #####.............     100%   ##########......    
+7    4%      4.15G    #####.............     98%    ##########......    
+8    5%      4.28G    #####.............     96%    ##########......    
+9    5%      4.01G    #####.............     87%    #########.......    
+10   4%      4.10G    #####.............     100%   ##########......    
+11   4%      4.20G    #####.............     96%    ##########......    
+12   5%      4.38G    #####.............     94%    #########.......    
+```
+
+## 三、结论
+- 资源用量在安全区间，没有明显瓶颈。
+
+---
+原始数据：`/mnt/x/ai_tool/see-through/workspace/log/20261121_185136/metrics.csv`
+
+报表已保存：/mnt/x/ai_tool/see-through/workspace/log/20261121_185136/report.md
+--------------------------------------------------------------------
+产物：/mnt/x/ai_tool/see-through/workspace/output/20261121_185136
+       └ fixed/    fix.py 后处理（拆层 + 排序），可直接给 Anime2.5DRig
+日志：/mnt/x/ai_tool/see-through/workspace/log/20261121_185136
+后处理：0 张成功, 0 张失败
+
+下次使用：把图片放进 target/，然后  bash batch.sh
+
+[WARN] 失败 3 张：t01:非显存错误 t02:非显存错误 t03:非显存错误
+eric@eric-u:/mnt/x/ai_tool/see-through/workspace$ 
+

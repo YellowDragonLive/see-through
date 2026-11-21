@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>See-through PSD 调优工作台 v2</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --card: #1f2430; --border: #2c3344;
+    --text: #e6ebf5; --muted: #8b95a9; --accent: #4f8cff; --ok: #34d399; --warn: #fbbf24; --danger: #f87171;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei", "PingFang SC", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; overflow: hidden; font-size: 13px; }
+  header { height: 48px; background: var(--panel); border-bottom: 1px solid var(--border); display: flex; align-items: center; padding: 0 14px; gap: 8px; }
+  header h1 { font-size: 14px; font-weight: 600; margin-right: 10px; white-space: nowrap; }
+  .btn { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px; transition: 0.15s; white-space: nowrap; }
+  .btn:hover { border-color: var(--accent); background: #262d3d; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .btn.primary:hover { background: #3b7bff; }
+  .btn.ok { background: #10b981; border-color: #10b981; color: #052e16; font-weight: 600; }
+  .btn.active { background: #2563eb; border-color: #60a5fa; color: #fff; }
+  .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .spacer { flex: 1; }
+  .status { color: var(--muted); font-size: 12px; max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  main { flex: 1; display: grid; grid-template-columns: 270px 1fr 330px; overflow: hidden; }
+  aside { background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+  aside.right { border-right: none; border-left: 1px solid var(--border); overflow-y: auto; padding: 10px; gap: 10px; }
+  .sec-title { font-size: 11px; letter-spacing: 0.5px; color: var(--muted); padding: 10px 12px 6px; font-weight: 600; }
+  .layer-list { flex: 1; overflow-y: auto; padding: 0 8px 12px; display: flex; flex-direction: column; gap: 4px; }
+  .layer-item { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .layer-item.selected { border-color: var(--accent); background: #222c42; }
+  .layer-item.hidden { opacity: 0.42; }
+  .layer-name { flex: 1; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .layer-meta { font-size: 10px; color: var(--muted); }
+  .mini-btn { background: transparent; border: 1px solid transparent; color: var(--muted); cursor: pointer; padding: 2px 4px; border-radius: 4px; font-size: 11px; }
+  .mini-btn:hover { color: var(--text); border-color: var(--border); background: #2a3142; }
+  .mini-btn.solo-on { color: var(--warn); border-color: var(--warn); }
+
+  .viewport { position: relative; display: flex; flex-direction: column; overflow: hidden; background: #12151d; }
+  .toolbar { min-height: 38px; background: var(--panel); border-bottom: 1px solid var(--border); display: flex; align-items: center; padding: 4px 10px; gap: 6px; flex-wrap: wrap; }
+  .canvas-wrap { flex: 1; overflow: auto; display: flex; align-items: center; justify-content: center; position: relative; }
+  .bg-checker { background-image: linear-gradient(45deg, #222631 25%, transparent 25%), linear-gradient(-45deg, #222631 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #222631 75%), linear-gradient(-45deg, transparent 75%, #222631 75%); background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0; background-color: #181b24; }
+  .bg-dark { background: #141414; }
+  .bg-light { background: #e5e7eb; }
+  .bg-green { background: #00b140; }
+  #stage { position: relative; display: inline-block; box-shadow: 0 10px 40px rgba(0,0,0,0.55); }
+  #previewImg { display: block; user-select: none; -webkit-user-drag: none; }
+  #drawCanvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; pointer-events: none; }
+  #drawCanvas.active { pointer-events: auto; }
+
+  /* 实时 3x 局部放大镜浮窗 */
+  #loupeBox {
+    position: absolute; right: 14px; bottom: 14px; width: 220px; height: 220px;
+    border: 2px solid var(--accent); border-radius: 10px; overflow: hidden;
+    background: #141720; box-shadow: 0 8px 28px rgba(0,0,0,0.65);
+    display: none; pointer-events: none; z-index: 20;
+  }
+  #loupeCanvas { width: 220px; height: 220px; display: block; }
+  #loupeLabel {
+    position: absolute; left: 6px; top: 6px; background: rgba(15,17,23,0.82);
+    color: var(--ok); font-size: 11px; padding: 2px 6px; border-radius: 4px;
+  }
+
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 7px; }
+  .card h3 { font-size: 12px; font-weight: 600; color: #cbd5e1; display: flex; justify-content: space-between; align-items: center; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .row label { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .row input[type=range] { flex: 1; accent-color: var(--accent); min-width: 60px; }
+  .row select { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; font-size: 12px; flex: 1; }
+  .val { min-width: 38px; text-align: right; font-variant-numeric: tabular-nums; color: var(--text); font-size: 11px; }
+  .drop-hint { text-align: center; color: var(--muted); padding: 40px; border: 2px dashed var(--border); border-radius: 12px; max-width: 440px; line-height: 1.7; }
+  .roi-bar { display: flex; gap: 4px; flex-wrap: wrap; }
+  .roi-bar .btn { padding: 3px 8px; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>See-through PSD 调优工作台</h1>
+  <label class="btn primary">加载 .PSD <input id="psdFile" type="file" accept=".psd" hidden></label>
+  <label class="btn">+ 加载深度图 <input id="depthFile" type="file" accept=".psd" hidden></label>
+  <button class="btn" id="btnReset">恢复原图</button>
+  <button class="btn" id="btnUndo" disabled>撤销笔刷</button>
+  <div class="spacer"></div>
+  <span class="status" id="statusText">请拖入 .psd（可同时拖入 *_depth.psd）开始调优</span>
+  <button class="btn ok" id="btnExportPsd" disabled>导出 .PSD</button>
+  <button class="btn" id="btnExportPng" disabled>导出预览图</button>
+</header>
+
+<main>
+  <aside>
+    <div class="sec-title">图层列表（上层 &rarr; 下层）</div>
+    <div class="layer-list" id="layerList"></div>
+  </aside>
+
+  <section class="viewport">
+    <div class="toolbar">
+      <button class="btn" id="btnCompare">按住对比原图</button>
+      <select id="bgMode" class="btn">
+        <option value="bg-checker">棋盘格</option>
+        <option value="bg-dark">深色底</option>
+        <option value="bg-light">浅色底</option>
+        <option value="bg-green">绿幕底</option>
+      </select>
+      <span style="border-left:1px solid var(--border);height:18px"></span>
+      <span style="color:var(--muted);font-size:11px">局部聚焦:</span>
+      <div class="roi-bar">
+        <button class="btn active" data-roi="full">整图</button>
+        <button class="btn" data-roi="face">脸部</button>
+        <button class="btn" data-roi="neck">脖子/领口</button>
+        <button class="btn" data-roi="head">头饰/头发</button>
+        <button class="btn" data-roi="torso">上衣</button>
+        <button class="btn" data-roi="selected">当前选中层</button>
+      </div>
+      <button class="btn active" id="btnLoupe">3×放大镜</button>
+      <span style="border-left:1px solid var(--border);height:18px"></span>
+      <label style="color:var(--muted);font-size:11px">缩放</label>
+      <input type="range" id="zoomSlider" min="30" max="250" value="80" style="width:75px">
+      <span class="val" id="zoomVal">80%</span>
+      <span style="border-left:1px solid var(--border);height:18px"></span>
+      <label style="color:var(--muted);font-size:11px">抬头测试 X/Y</label>
+      <input type="range" id="headX" min="-35" max="35" value="0" style="width:55px">
+      <input type="range" id="headY" min="-35" max="35" value="0" style="width:55px">
+      <button class="btn" id="btnHeadReset">归零</button>
+    </div>
+    <div class="canvas-wrap bg-checker" id="canvasWrap">
+      <div class="drop-hint" id="dropHint">
+        <div style="font-size:15px;font-weight:600;color:var(--text);margin-bottom:8px">把 .psd（可同时选 *_depth.psd）拖到这里</div>
+        <div>支持 NF4 边框噪点去雾、8 种图层排序算法实时切换、脖子/领口伪深度拆分、局部高清聚焦与 3× 放大镜、画布直接橡皮擦修补。</div>
+      </div>
+      <div id="stage" style="display:none">
+        <img id="previewImg" alt="预览画布">
+        <canvas id="drawCanvas"></canvas>
+      </div>
+      <div id="loupeBox">
+        <canvas id="loupeCanvas" width="220" height="220"></canvas>
+        <div id="loupeLabel">3× 局部特写</div>
+      </div>
+    </div>
+  </section>
+
+  <aside class="right">
+    <div class="card">
+      <h3>1. 图层排序算法（一键切换）</h3>
+      <div class="row">
+        <label>排序策略</label>
+        <select id="pSortMode">
+          <option value="auto">综合智能（伪深度 + 解剖锁）</option>
+          <option value="local_overlap">局部重叠区逐像素深度</option>
+          <option value="depth">纯伪深度中位数</option>
+          <option value="classic">经典 Live2D 固定解剖序</option>
+          <option value="arms_front">手臂优先在前（handwear 置顶）</option>
+          <option value="arms_back">手臂优先在后（handwear 置底）</option>
+          <option value="hair_over_top">垂发压在上衣前（back hair 提前）</option>
+          <option value="raw">保持原始 PSD 顺序</option>
+        </select>
+      </div>
+      <button class="btn" id="btnSortOnly">仅重排图层（不改动像素）</button>
+    </div>
+
+    <div class="card">
+      <h3>2. 透明噪点与边框去雾</h3>
+      <div class="row"><label>Alpha 截断</label><input type="range" id="pAlphaFloor" min="0" max="40" value="16"><span class="val" id="vAlphaFloor">16</span></div>
+      <div class="row"><label>碎块过滤(px)</label><input type="range" id="pMinArea" min="0" max="400" step="10" value="60"><span class="val" id="vMinArea">60</span></div>
+      <div class="row"><label>裁切边框</label><input type="range" id="pBorderPx" min="0" max="40" value="0"><span class="val" id="vBorderPx">0px</span></div>
+      <div class="row"><label>边缘去色晕</label><input type="range" id="pDecontam" min="0" max="5" value="0"><span class="val" id="vDecontam">0</span></div>
+    </div>
+
+    <div class="card">
+      <h3>3. 脖子 &harr; 上衣领口求解</h3>
+      <div class="row"><label>处理模式</label>
+        <select id="pCollarMode">
+          <option value="auto">自动（重复肤色抠空 + 伪深度拆分）</option>
+          <option value="skin_cut">仅重复肤色抠空（水手服/开领）</option>
+          <option value="depth_sandwich">仅伪深度三明治拆分（高领/椅背）</option>
+          <option value="off">关闭</option>
+        </select>
+      </div>
+      <div class="row"><label>深度微调偏移</label><input type="range" id="pDepthOff" min="-0.25" max="0.25" step="0.01" value="0"><span class="val" id="vDepthOff">0.00</span></div>
+      <div class="row"><label>肤色色差阈值</label><input type="range" id="pSkinDiff" min="10" max="45" value="24"><span class="val" id="vSkinDiff">24</span></div>
+      <div class="row"><label>边缘羽化</label><input type="range" id="pFeather" min="0" max="3" step="0.2" value="1.0"><span class="val" id="vFeather">1.0</span></div>
+      <button class="btn primary" id="btnApply">应用全套 CV 处理与排序</button>
+    </div>
+
+    <div class="card">
+      <h3>4. 任意选中层按深度一分为二</h3>
+      <div class="row"><label>当前目标层</label><span id="selLayerLabel" style="color:var(--ok);font-weight:600">（请在左侧点选图层）</span></div>
+      <div class="row"><label>手动深度阈值</label><input type="range" id="pSplitThr" min="0.05" max="0.95" step="0.01" value="0.50"><span class="val" id="vSplitThr">自动</span></div>
+      <div class="row">
+        <button class="btn" id="btnSplitAuto" style="flex:1">自动拆分（Otsu）</button>
+        <button class="btn" id="btnSplitManual" style="flex:1">按滑块阈值拆分</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>5. 画布手动修补笔刷（作用于选中层）</h3>
+      <div class="row">
+        <button class="btn" id="btnBrushOff" style="flex:1">浏览</button>
+        <button class="btn" id="btnBrushErase" style="flex:1">橡皮擦</button>
+        <button class="btn" id="btnBrushRestore" style="flex:1">还原原像素</button>
+      </div>
+      <div class="row"><label>笔刷半径</label><input type="range" id="pBrushSize" min="4" max="120" value="28"><span class="val" id="vBrushSize">28px</span></div>
+    </div>
+  </aside>
+</main>
+
+<script>
+const S = {
+  state: null, selected: null, solo: null, compareOrig: false,
+  roiMode: 'full', activeCrop: null, loupeOn: true,
+  brushMode: 'off', drawing: false, strokePts: [],
+  pendingPsd: null, pendingDepth: null, pendingName: ''
+};
+
+const $ = id => document.getElementById(id);
+const setStatus = txt => { $('statusText').textContent = txt; };
+
+function bindSlider(id, vid, suffix='', fixed=null) {
+  const el = $(id), vel = $(vid);
+  const upd = () => { vel.textContent = (fixed !== null ? Number(el.value).toFixed(fixed) : el.value) + suffix; };
+  el.addEventListener('input', upd); upd();
+}
+bindSlider('pAlphaFloor', 'vAlphaFloor');
+bindSlider('pMinArea', 'vMinArea');
+bindSlider('pBorderPx', 'vBorderPx', 'px');
+bindSlider('pDecontam', 'vDecontam');
+bindSlider('pDepthOff', 'vDepthOff', '', 2);
+bindSlider('pSkinDiff', 'vSkinDiff');
+bindSlider('pFeather', 'vFeather', '', 1);
+bindSlider('pBrushSize', 'vBrushSize', 'px');
+$('pSplitThr').addEventListener('input', () => { $('vSplitThr').textContent = Number($('pSplitThr').value).toFixed(2); });
+
+async function apiPost(path, payload) {
+  const res = await fetch(path, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+  return await res.json();
+}
+
+function fileToB64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result.split(',')[1]);
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
+}
+
+async function uploadToServer() {
+  if (!S.pendingPsd) return;
+  setStatus('正在解析 PSD...');
+  const st = await apiPost('/api/load', { filename: S.pendingName, psd_b64: S.pendingPsd, depth_b64: S.pendingDepth });
+  S.roiMode = 'full'; S.activeCrop = null;
+  document.querySelectorAll('.roi-bar .btn').forEach(b => b.classList.toggle('active', b.dataset.roi === 'full'));
+  updateUI(st, `已加载 ${st.filename}（${st.width}×${st.height}，${st.layers.length} 个图层）`);
+}
+
+$('psdFile').addEventListener('change', async e => {
+  const f = e.target.files[0]; if (!f) return;
+  S.pendingName = f.name; S.pendingPsd = await fileToB64(f);
+  await uploadToServer();
+});
+$('depthFile').addEventListener('change', async e => {
+  const f = e.target.files[0]; if (!f) return;
+  S.pendingDepth = await fileToB64(f);
+  if (S.pendingPsd) await uploadToServer();
+  else setStatus(`已就绪深度图：${f.name}（请再加载主 .psd）`);
+});
+
+$('canvasWrap').addEventListener('dragover', e => e.preventDefault());
+$('canvasWrap').addEventListener('drop', async e => {
+  e.preventDefault();
+  for (const f of e.dataTransfer.files) {
+    if (!f.name.toLowerCase().endsWith('.psd')) continue;
+    if (f.name.toLowerCase().includes('_depth')) S.pendingDepth = await fileToB64(f);
+    else { S.pendingName = f.name; S.pendingPsd = await fileToB64(f); }
+  }
+  await uploadToServer();
+});
+
+function computeActiveCrop() {
+  if (!S.state || S.roiMode === 'full') return null;
+  if (S.roiMode === 'selected') {
+    if (!S.selected) return null;
+    const L = S.state.layers.find(x => x.name === S.selected);
+    if (!L) return null;
+    const [x0, y0, x1, y1] = L.bbox;
+    const pad = Math.max(40, Math.round(Math.max(x1 - x0, y1 - y0) * 0.25));
+    return [Math.max(0, x0 - pad), Math.max(0, y0 - pad), Math.min(S.state.width, x1 + pad), Math.min(S.state.height, y1 + pad)];
+  }
+  return (S.state.rois && S.state.rois[S.roiMode]) ? S.state.rois[S.roiMode] : null;
+}
+
+document.querySelectorAll('.roi-bar .btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    if (!S.state) return;
+    if (btn.dataset.roi === 'selected' && !S.selected) { setStatus('请先在左侧点击选中一个图层'); return; }
+    S.roiMode = btn.dataset.roi;
+    document.querySelectorAll('.roi-bar .btn').forEach(b => b.classList.toggle('active', b === btn));
+    if (S.roiMode !== 'full' && Number($('zoomSlider').value) < 120) $('zoomSlider').value = 140;
+    if (S.roiMode === 'full') $('zoomSlider').value = 80;
+    refreshPreview();
+  });
+});
+
+$('btnLoupe').addEventListener('click', () => {
+  S.loupeOn = !S.loupeOn;
+  $('btnLoupe').classList.toggle('active', S.loupeOn);
+  if (!S.loupeOn) $('loupeBox').style.display = 'none';
+});
+
+function refreshPreview() {
+  if (!S.state) return;
+  S.activeCrop = computeActiveCrop();
+  const hdx = $('headX').value, hdy = $('headY').value;
+  const params = { orig: S.compareOrig ? '1' : '0', solo: S.solo || '', hdx, hdy, t: Date.now() };
+  if (S.activeCrop) params.crop = S.activeCrop.join(',');
+  const qs = new URLSearchParams(params);
+  const img = $('previewImg');
+  img.onload = () => {
+    applyZoom();
+    const cv = $('drawCanvas');
+    cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+  };
+  img.src = '/api/preview?' + qs.toString();
+}
+
+function applyZoom() {
+  const img = $('previewImg');
+  if (!S.state || !img.naturalWidth) return;
+  const z = Number($('zoomSlider').value) / 100;
+  $('zoomVal').textContent = Math.round(z * 100) + '%';
+  const baseW = S.activeCrop ? (S.activeCrop[2] - S.activeCrop[0]) : S.state.width;
+  const baseH = S.activeCrop ? (S.activeCrop[3] - S.activeCrop[1]) : S.state.height;
+  // Fit localized crop nicely to viewport scale
+  const fitScale = S.activeCrop ? Math.min(2.2, 520 / Math.max(baseW, baseH)) : 1.0;
+  img.style.width = Math.round(baseW * fitScale * z) + 'px';
+  img.style.height = Math.round(baseH * fitScale * z) + 'px';
+}
+$('zoomSlider').addEventListener('input', applyZoom);
+$('bgMode').addEventListener('change', () => { $('canvasWrap').className = 'canvas-wrap ' + $('bgMode').value; });
+$('headX').addEventListener('change', refreshPreview);
+$('headY').addEventListener('change', refreshPreview);
+$('btnHeadReset').addEventListener('click', () => { $('headX').value = 0; $('headY').value = 0; refreshPreview(); });
+
+$('btnCompare').addEventListener('mousedown', () => { S.compareOrig = true; refreshPreview(); });
+window.addEventListener('mouseup', () => { if (S.compareOrig) { S.compareOrig = false; refreshPreview(); } });
+
+// 3x 实时放大镜绘制
+const lCanvas = $('loupeCanvas'), lCtx = lCanvas.getContext('2d');
+$('stage').addEventListener('mousemove', e => {
+  const img = $('previewImg');
+  if (!S.loupeOn || !S.state || !img.naturalWidth) return;
+  const rect = img.getBoundingClientRect();
+  const rx = (e.clientX - rect.left) / rect.width;
+  const ry = (e.clientY - rect.top) / rect.height;
+  if (rx < 0 || rx > 1 || ry < 0 || ry > 1) { $('loupeBox').style.display = 'none'; return; }
+  $('loupeBox').style.display = 'block';
+  const cx = rx * img.naturalWidth, cy = ry * img.naturalHeight;
+  const srcW = 74, srcH = 74; // 220 / 3 ≈ 74px source window -> 3x zoom
+  lCtx.imageSmoothingEnabled = false;
+  lCtx.fillStyle = '#181b24';
+  lCtx.fillRect(0, 0, 220, 220);
+  lCtx.drawImage(img, cx - srcW / 2, cy - srcH / 2, srcW, srcH, 0, 0, 220, 220);
+  // Crosshair
+  lCtx.strokeStyle = 'rgba(79,140,255,0.55)';
+  lCtx.beginPath(); lCtx.moveTo(110, 0); lCtx.lineTo(110, 220); lCtx.moveTo(0, 110); lCtx.lineTo(220, 110); lCtx.stroke();
+  const absX = Math.round((S.activeCrop ? S.activeCrop[0] : 0) + cx);
+  const absY = Math.round((S.activeCrop ? S.activeCrop[1] : 0) + cy);
+  $('loupeLabel').textContent = `3× 局部 (${absX}, ${absY})`;
+});
+$('stage').addEventListener('mouseleave', () => { $('loupeBox').style.display = 'none'; });
+
+function updateUI(st, msg) {
+  if (st.error) { setStatus('提示：' + st.error); return; }
+  S.state = st;
+  $('dropHint').style.display = 'none';
+  $('stage').style.display = 'inline-block';
+  $('btnExportPsd').disabled = false;
+  $('btnExportPng').disabled = false;
+  $('btnUndo').disabled = !st.can_undo;
+  if (msg || st.log) setStatus(msg || st.log);
+  renderLayers();
+  refreshPreview();
+}
+
+function renderLayers() {
+  const list = $('layerList');
+  list.innerHTML = '';
+  const layers = [...S.state.layers].reverse();
+  layers.forEach((L, revIdx) => {
+    const idx = S.state.layers.length - 1 - revIdx;
+    const el = document.createElement('div');
+    el.className = 'layer-item' + (S.selected === L.name ? ' selected' : '') + (!L.visible ? ' hidden' : '');
+    const hazeTag = L.haze_pixels > 5000 ? ` <span style="color:var(--warn)">(噪点:${Math.round(L.haze_pixels/1000)}k)</span>` : '';
+    el.innerHTML = `
+      <button class="mini-btn" title="显示/隐藏" data-act="vis">${L.visible ? '&#128065;' : '&#8709;'}</button>
+      <div class="layer-name">${L.name}<div class="layer-meta">深度=${L.depth_median} | ${Math.round(L.pixels/1000)}k 像素${hazeTag}</div></div>
+      <button class="mini-btn ${S.solo === L.name ? 'solo-on' : ''}" title="仅显示此层" data-act="solo">独</button>
+      <button class="mini-btn" title="上移一层" data-act="up">&#9650;</button>
+      <button class="mini-btn" title="下移一层" data-act="dn">&#9660;</button>
+    `;
+    el.addEventListener('click', async e => {
+      const act = e.target.dataset.act;
+      if (act === 'vis') {
+        updateUI(await apiPost('/api/visibility', { name: L.name, visible: !L.visible }));
+      } else if (act === 'solo') {
+        S.solo = (S.solo === L.name) ? null : L.name;
+        renderLayers(); refreshPreview();
+      } else if (act === 'up' || act === 'dn') {
+        const ord = S.state.layers.map(x => x.name);
+        const swap = act === 'up' ? idx + 1 : idx - 1;
+        if (swap >= 0 && swap < ord.length) {
+          [ord[idx], ord[swap]] = [ord[swap], ord[idx]];
+          updateUI(await apiPost('/api/reorder', { order: ord }), `已移动图层：${L.name}`);
+        }
+      } else {
+        S.selected = L.name;
+        $('selLayerLabel').textContent = L.name;
+        renderLayers();
+        if (S.roiMode === 'selected') refreshPreview();
+      }
+    });
+    list.appendChild(el);
+  });
+}
+
+$('btnSortOnly').addEventListener('click', async () => {
+  if (!S.state) return;
+  setStatus('正在重排图层...');
+  updateUI(await apiPost('/api/sort', { sort_mode: $('pSortMode').value }));
+});
+
+$('btnApply').addEventListener('click', async () => {
+  if (!S.state) return;
+  setStatus('正在执行 CV 清洗、领口拆分与排序...');
+  const st = await apiPost('/api/apply', {
+    reset_first: true,
+    alpha_floor: Number($('pAlphaFloor').value),
+    min_area: Number($('pMinArea').value),
+    border_px: Number($('pBorderPx').value),
+    decontam_radius: Number($('pDecontam').value),
+    collar_mode: $('pCollarMode').value,
+    depth_offset: Number($('pDepthOff').value),
+    skin_diff: Number($('pSkinDiff').value),
+    feather: Number($('pFeather').value),
+    sort_mode: $('pSortMode').value,
+  });
+  updateUI(st);
+});
+
+$('btnReset').addEventListener('click', async () => { S.solo = null; updateUI(await apiPost('/api/reset', {}), '已恢复为原始 PSD'); });
+$('btnUndo').addEventListener('click', async () => { updateUI(await apiPost('/api/undo', {}), '已撤销上一步笔刷'); });
+
+$('btnSplitAuto').addEventListener('click', async () => {
+  if (!S.selected) return setStatus('请先在左侧点击选中要拆分的图层');
+  updateUI(await apiPost('/api/split', { name: S.selected, threshold: null, feather: Number($('pFeather').value) }));
+});
+$('btnSplitManual').addEventListener('click', async () => {
+  if (!S.selected) return setStatus('请先在左侧点击选中要拆分的图层');
+  updateUI(await apiPost('/api/split', { name: S.selected, threshold: Number($('pSplitThr').value), feather: Number($('pFeather').value) }));
+});
+
+function setBrush(m) {
+  S.brushMode = m;
+  ['btnBrushOff', 'btnBrushErase', 'btnBrushRestore'].forEach(id => $(id).classList.remove('active'));
+  $(m === 'off' ? 'btnBrushOff' : m === 'erase' ? 'btnBrushErase' : 'btnBrushRestore').classList.add('active');
+  $('drawCanvas').classList.toggle('active', m !== 'off');
+}
+setBrush('off');
+$('btnBrushOff').addEventListener('click', () => setBrush('off'));
+$('btnBrushErase').addEventListener('click', () => setBrush('erase'));
+$('btnBrushRestore').addEventListener('click', () => setBrush('restore'));
+
+const dc = $('drawCanvas'), dctx = dc.getContext('2d');
+function getCanvasPt(e) {
+  const rect = dc.getBoundingClientRect();
+  const lx = (e.clientX - rect.left) * (dc.width / rect.width);
+  const ly = (e.clientY - rect.top) * (dc.height / rect.height);
+  // Map local crop coordinates back to full PSD coordinates for brush API!
+  const ox = S.activeCrop ? S.activeCrop[0] : 0;
+  const oy = S.activeCrop ? S.activeCrop[1] : 0;
+  return { local: [lx, ly], abs: [ox + lx, oy + ly] };
+}
+dc.addEventListener('mousedown', e => {
+  if (S.brushMode === 'off' || !S.selected) { if (!S.selected) setStatus('请先在左侧选中要擦除/还原的图层'); return; }
+  S.drawing = true; S.strokePts = [getCanvasPt(e)];
+  dctx.clearRect(0, 0, dc.width, dc.height);
+});
+dc.addEventListener('mousemove', e => {
+  if (!S.drawing) return;
+  const pt = getCanvasPt(e);
+  const prev = S.strokePts[S.strokePts.length - 1];
+  S.strokePts.push(pt);
+  dctx.strokeStyle = S.brushMode === 'erase' ? 'rgba(248,113,113,0.65)' : 'rgba(52,211,153,0.65)';
+  dctx.lineWidth = Number($('pBrushSize').value) * 2;
+  dctx.lineCap = 'round';
+  dctx.beginPath(); dctx.moveTo(prev.local[0], prev.local[1]); dctx.lineTo(pt.local[0], pt.local[1]); dctx.stroke();
+});
+window.addEventListener('mouseup', async () => {
+  if (!S.drawing) return;
+  S.drawing = false;
+  const pts = S.strokePts.map(p => p.abs); S.strokePts = [];
+  dctx.clearRect(0, 0, dc.width, dc.height);
+  if (pts.length) {
+    const st = await apiPost('/api/brush', { name: S.selected, mode: S.brushMode, radius: Number($('pBrushSize').value), points: pts });
+    updateUI(st, `已在 ${S.selected} 执行${S.brushMode === 'erase' ? '橡皮擦' : '还原笔刷'}`);
+  }
+});
+
+$('btnExportPsd').addEventListener('click', () => { window.location.href = '/api/export/psd'; });
+$('btnExportPng').addEventListener('click', () => { window.location.href = '/api/export/png'; });
+</script>
+</body>
+</html>

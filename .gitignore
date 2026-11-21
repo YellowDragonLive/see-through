@@ -6,7 +6,20 @@ hf_credential
 !*.example
 
 # ── Workspace (datasets, model weights) ──────────────────────────
-workspace/
+# 产物/权重默认全部忽略, 但代码脚本类文件纳入版本控制
+workspace/*
+!workspace/*.py
+!workspace/*.sh
+!workspace/*.bat
+!workspace/*.cmd
+!workspace/*.ps1
+!workspace/*.txt
+!workspace/*.md
+!workspace/psd_studio_v2_1_fast_20261121_2050/
+workspace/psd_studio_v2_1_fast_20261121_2050/*
+!workspace/psd_studio_v2_1_fast_20261121_2050/psd_studio.py
+!workspace/psd_studio_v2_1_fast_20261121_2050/psd_studio.html
+!workspace/psd_studio_v2_1_fast_20261121_2050/start_studio_win.bat
 
 # ── Python ────────────────────────────────────────────────────────
 __pycache__/

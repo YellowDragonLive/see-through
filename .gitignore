@@ -33,6 +33,14 @@ tmp/
 wandb/
 local_*
 
+# ── 本地临时补丁 / 基线 / 导出产物 ──────────────────────────────
+_BASE_HASHES.json
+_CHANGES.patch
+fix.py
+seethrough_*.patch
+seethrough_*.zip
+target/
+
 # ── Symlink (user creates locally: ln -sf common/assets assets) ──
 /assets
 # end of file

@@ -690,8 +690,14 @@ def _depth_split_bimodal_parts(tag2pinfo: dict, frame_size, use_lama: bool = Fal
             if fn >= 4000 and bn >= 4000 and (fn / ov_n) >= 0.22 and (bn / ov_n) >= 0.18:
                 thresh = 0.5 * (float(np.median(bh_dep[f_ov])) + float(np.median(bh_dep[b_ov])))
                 raw_f = ((bh_m & (bh_dep < thresh)) | f_ov) & (~b_ov)
+                # Exclude neck region so hair behind the neck never jumps in front of neck/chin (fixes fix3)
+                if 'neck' in tag2pinfo:
+                    nk_img, _ = _part_to_full_canvas(tag2pinfo['neck'], H, W)
+                    raw_f = raw_f & (~(nk_img[..., 3] > 32))
+                k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                raw_f = cv2.morphologyEx(raw_f.astype(np.uint8), cv2.MORPH_OPEN, k_open) > 0
                 nf, flab, fstats, _ = cv2.connectedComponentsWithStats(raw_f.astype(np.uint8), connectivity=4)
-                keep_f = [c for c in range(1, nf) if fstats[c, cv2.CC_STAT_AREA] >= 500]
+                keep_f = [c for c in range(1, nf) if fstats[c, cv2.CC_STAT_AREA] >= 2500]
                 if keep_f:
                     clean_f = np.isin(flab, keep_f)
                     soft_f = _guided_filter_mask(bh_img[..., :3], clean_f.astype(np.float32), radius=6, eps=1e-3)
@@ -767,6 +773,120 @@ def _clean_eyelash_skin_fringe(eyelash_dict: dict, face_dict: dict):
     fringe_skin = (img[..., 3] > 0) & (img[..., 3] < 160) & (diff < 0.14)
     if np.any(fringe_skin):
         img[fringe_skin, 3] = (img[fringe_skin, 3].astype(np.float32) * 0.25).astype(np.uint8)
+
+
+
+
+def _fill_head_interior_gaps(tag2pinfo: dict, frame_size):
+    """Close enclosed interior transparent pockets between front hair, back hair, face and ears (fixes fix2)."""
+    bh_key = 'back hair_1' if 'back hair_1' in tag2pinfo else ('back hair' if 'back hair' in tag2pinfo else None)
+    if bh_key is None or 'face' not in tag2pinfo:
+        return
+    H, W = int(frame_size[0]), int(frame_size[1])
+    bh_img, bh_dep = _part_to_full_canvas(tag2pinfo[bh_key], H, W)
+    union = bh_img[..., 3] > 24
+    for k in ('front hair', 'back hair_2', 'face', 'ears', 'headwear'):
+        if k in tag2pinfo:
+            ki, _ = _part_to_full_canvas(tag2pinfo[k], H, W)
+            union = union | (ki[..., 3] > 24)
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
+    closed = cv2.morphologyEx(union.astype(np.uint8), cv2.MORPH_CLOSE, k_close)
+    ff = closed.copy()
+    cv2.floodFill(ff, np.zeros((H + 2, W + 2), np.uint8), (0, 0), 2)
+    bh_near = cv2.dilate((bh_img[..., 3] > 24).astype(np.uint8), k_close) > 0
+    holes = ((ff == 0) | ((closed > 0) & (~union))) & (~union) & bh_near
+    n_h = int(holes.sum())
+    if n_h < 40 or n_h > 40000:
+        return
+    ys, xs = np.nonzero(holes | (bh_img[..., 3] > 24))
+    y1, y2 = max(0, int(ys.min()) - 4), min(H, int(ys.max()) + 5)
+    x1, x2 = max(0, int(xs.min()) - 4), min(W, int(xs.max()) + 5)
+    rgb_crop = bh_img[y1:y2, x1:x2, :3].copy()
+    hole_u8 = (holes[y1:y2, x1:x2].astype(np.uint8)) * 255
+    inpainted = cv2.inpaint(rgb_crop, hole_u8, inpaintRadius=7, flags=cv2.INPAINT_TELEA)
+    bh_img[y1:y2, x1:x2, :3] = np.where(hole_u8[..., None] > 0, inpainted, rgb_crop)
+    hole_a = cv2.GaussianBlur(hole_u8.astype(np.float32), (0, 0), 1.0)
+    bh_img[y1:y2, x1:x2, 3] = np.maximum(bh_img[y1:y2, x1:x2, 3], np.clip(np.round(hole_a), 0, 255).astype(np.uint8))
+    updated = _make_split_part_from_rgba(bh_key, bh_img, bh_dep)
+    if updated is not None:
+        updated['depth_median'] = tag2pinfo[bh_key]['depth_median']
+        tag2pinfo[bh_key] = updated
+
+
+def _clean_and_split_objects(tag2pinfo: dict, frame_size):
+    """Remove isolated floating debris in `objects` (fixes fix6 top-right speck) and split foreground props
+    (e.g. laptop screen / coffee cup in front of hands) from background props using depth."""
+    if 'objects' not in tag2pinfo:
+        return
+    H, W = int(frame_size[0]), int(frame_size[1])
+    obj = tag2pinfo['objects']
+    obj_img, obj_dep = _part_to_full_canvas(obj, H, W)
+    obj_m = obj_img[..., 3] > 24
+    if int(obj_m.sum()) < 50:
+        return
+
+    body_m = np.zeros((H, W), dtype=bool)
+    for k, pd in tag2pinfo.items():
+        if _norm_part_role(k) != 'objects':
+            bi, _ = _part_to_full_canvas(pd, H, W)
+            body_m |= (bi[..., 3] > 24)
+    k_near = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    body_near = cv2.dilate(body_m.astype(np.uint8), k_near) > 0
+
+    n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(obj_m.astype(np.uint8), connectivity=8)
+    if n_lbl > 2:
+        areas = [int(stats[c, cv2.CC_STAT_AREA]) for c in range(n_lbl)]
+        max_a = max(areas[1:])
+        for c in range(1, n_lbl):
+            if areas[c] < max(8000, int(max_a * 0.04)):
+                cm = labels == c
+                if not np.any(cm & body_near):
+                    obj_img[cm, 3] = 0
+                    obj_m[cm] = False
+
+    hw_keys = [k for k in tag2pinfo if _norm_part_role(k) == 'handwear']
+    if hw_keys:
+        hw_m = np.zeros((H, W), dtype=bool)
+        hw_d = np.ones((H, W), dtype=np.float32)
+        for hk in hw_keys:
+            hi, hd = _part_to_full_canvas(tag2pinfo[hk], H, W)
+            hm = hi[..., 3] > 32
+            hw_d = np.where(hm & (hd < hw_d), hd, hw_d)
+            hw_m |= hm
+        ov = obj_m & hw_m
+        ov_n = int(ov.sum())
+        if ov_n >= 1500:
+            diff = obj_dep - hw_d
+            f_ov = ov & (diff < -0.025)
+            b_ov = ov & (diff > 0.025)
+            if int(f_ov.sum()) >= 800 and int(b_ov.sum()) >= 800:
+                med_f, med_b = float(np.median(obj_dep[f_ov])), float(np.median(obj_dep[b_ov]))
+                if abs(med_b - med_f) >= 0.12:
+                    thresh = 0.5 * (med_f + med_b)
+                    raw_f = ((obj_m & (obj_dep < thresh)) | f_ov) & (~b_ov)
+                    nf, flab, fstats, _ = cv2.connectedComponentsWithStats(raw_f.astype(np.uint8), connectivity=4)
+                    clean_f = np.isin(flab, [c for c in range(1, nf) if fstats[c, cv2.CC_STAT_AREA] >= 1200])
+                    clean_b = obj_m & (~clean_f)
+                    if int(clean_f.sum()) >= 1500 and int(clean_b.sum()) >= 1500:
+                        soft_f = _guided_filter_mask(obj_img[..., :3], clean_f.astype(np.float32), radius=5, eps=1e-3)
+                        fg_rgba = obj_img.copy()
+                        fg_rgba[..., 3] = np.clip(np.round(obj_img[..., 3].astype(np.float32) * soft_f), 0, 255).astype(np.uint8)
+                        bg_rgba = _extend_back_underlap(obj_img, 1.0 - soft_f, clean_f, seam_px=6, use_lama=False)
+                        p_bg = _make_split_part_from_rgba('objects_1', bg_rgba, obj_dep)
+                        p_fg = _make_split_part_from_rgba('objects_2', fg_rgba, obj_dep)
+                        if p_bg is not None and p_fg is not None:
+                            hw_min = min(float(tag2pinfo[hk]['depth_median']) for hk in hw_keys)
+                            p_fg['depth_median'] = min(p_fg['depth_median'], hw_min - 0.01)
+                            p_bg['depth_median'] = max(p_bg['depth_median'], hw_min + 0.02)
+                            tag2pinfo.pop('objects')
+                            tag2pinfo['objects_1'] = p_bg
+                            tag2pinfo['objects_2'] = p_fg
+                            return
+
+    updated = _make_split_part_from_rgba('objects', obj_img, obj_dep)
+    if updated is not None:
+        updated['depth_median'] = obj['depth_median']
+        tag2pinfo['objects'] = updated
 
 
 def _sort_parts_by_local_overlap(part_dict_list: list, frame_size, fullpage=None):
@@ -860,7 +980,7 @@ def _sort_parts_by_local_overlap(part_dict_list: list, frame_size, fullpage=None
     # 3. Lock v3 anatomical face/eye stack: back hair/neck/ears < face < mouth/nose < eyewhite < irides < eyelash < front hair
     face_rank = {
         'facedetail': 1, 'nose': 1, 'mouth': 1,
-        'eyewhite': 2, 'irides': 3, 'eyelash': 4, 'eyebrow': 4, 'eyewear': 5,
+        'eyewhite': 2, 'irides': 3, 'eyelash': 4, 'eyebrow': 4, 'eyewear': 5, 'headwear': 5,
     }
     above_face = {'front hair', 'side hair', 'ahoge'}
     below_face = {'back hair', 'neck', 'ears'}
@@ -982,6 +1102,8 @@ def further_extr(srcd: str, rotate=True, save_to_psd=False, tblr_split=True):
 
     # Plan C: depth-cliff split (Guided Filter edge snapping + back-layer underlap inpaint)
     _depth_split_bimodal_parts(tag2pinfo, fullpage.shape[:2])
+    _clean_and_split_objects(tag2pinfo, fullpage.shape[:2])
+    _fill_head_interior_gaps(tag2pinfo, fullpage.shape[:2])
 
     # Plan C: edge RGB decontamination (eliminates dark/gray halos on transparent fringes)
     for _pdict in tag2pinfo.values():
@@ -1003,7 +1125,7 @@ def further_extr(srcd: str, rotate=True, save_to_psd=False, tblr_split=True):
 
     if 'face' in tag2pinfo:
         fd = float(tag2pinfo['face']['depth_median'])
-        for idx_t, t in enumerate(['nose', 'mouth', 'eyes', 'eyewhite', 'irides', 'eyelash', 'eyebrow']):
+        for idx_t, t in enumerate(['nose', 'mouth', 'eyes', 'eyewhite', 'irides', 'eyelash', 'eyebrow', 'headwear']):
             if t in tag2pinfo:
                 target_max = fd - 0.001 * (idx_t + 1)
                 if tag2pinfo[t]['depth_median'] > target_max:

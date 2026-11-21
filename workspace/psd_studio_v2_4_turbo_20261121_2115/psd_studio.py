@@ -11,6 +11,7 @@ import os
 import struct
 import sys
 import threading
+import time
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -530,7 +531,8 @@ def refine_neck_topwear(layers_map, depth_map, H, W, mode="auto", depth_offset=0
                 k_up8 = np.zeros((17, 3), dtype=np.uint8); k_up8[8:, :] = 1
                 back_final = ((back_mask > 0) | ((cv2.dilate(back_mask, k_up8) > 0) & top_rim)) & (t_a > 0)
                 bm_u8 = back_final.astype(np.uint8)
-                bm_f = cv2.GaussianBlur(bm_u8.astype(np.float32), (0, 0), max(0.5, float(feather))) if feather > 0 else bm_u8.astype(np.float32)
+                bm_src = np.where(t_a == 0, 1.0, bm_u8.astype(np.float32))
+                bm_f = cv2.GaussianBlur(bm_src, (0, 0), max(0.5, float(feather))) if feather > 0 else bm_src
                 bm_b = cv2.GaussianBlur(cv2.dilate(bm_u8, k5).astype(np.float32), (0, 0), max(0.5, float(feather))) if feather > 0 else cv2.dilate(bm_u8, k5).astype(np.float32)
                 t_back = t_c.copy(); t_front = t_c.copy()
                 t_back[..., 3] = np.clip(np.round(t_a.astype(np.float32) * bm_b), 0, 255).astype(np.uint8)
@@ -543,6 +545,75 @@ def refine_neck_topwear(layers_map, depth_map, H, W, mode="auto", depth_offset=0
                 return layers_map, depth_map, f"伪深度三明治拆分(后领={int(back_final.sum())}px)"
     return layers_map, depth_map, "无需拆分"
 
+
+
+def refine_headwear_sandwich(layers_map, depth_map, H, W, enabled=True, depth_offset=0.0, feather=1.0):
+    """Per-pixel pseudo-depth Sandwich Split for headwear <-> face (e.g. beanie/hat opening covering face):
+    Splits `headwear` into `headwear_1` (depth > face_d -> behind face) and `headwear_2` (depth <= face_d -> in front of face & front hair)."""
+    if not enabled or "headwear" not in layers_map or "face" not in layers_map:
+        return layers_map, depth_map, "跳过"
+    hw_c = layers_map["headwear"]
+    fc_c = layers_map["face"]
+    hw_a = hw_c[..., 3]
+    hw_m = hw_a > 24
+    fc_m = fc_c[..., 3] > 24
+    ov = hw_m & fc_m
+    ov_cnt = int(ov.sum())
+    if ov_cnt < 300:
+        return layers_map, depth_map, "无重叠"
+
+    hwd = depth_map.get("headwear")
+    fcd = depth_map.get("face")
+    if hwd is None or fcd is None or float(np.std(hwd[hw_m])) < 0.05:
+        return layers_map, depth_map, "无有效深度差"
+
+    fc_med = float(np.median(fcd[fc_m]))
+    behind_all = hw_m & ((hwd + float(depth_offset)) > fc_med)
+    front_all = hw_m & ((hwd + float(depth_offset)) <= fc_med)
+    b_ov = int((ov & behind_all).sum())
+    f_all = int(front_all.sum())
+    if b_ov < 300 or f_all < 300 or (b_ov / ov_cnt) < 0.12:
+        return layers_map, depth_map, "无需拆分"
+
+    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    back_u8 = cv2.morphologyEx(behind_all.astype(np.uint8), cv2.MORPH_CLOSE, k5)
+    # Remove tiny specks from back_u8
+    n_cc, lab, stats, _ = cv2.connectedComponentsWithStats(back_u8, connectivity=8)
+    back_clean = np.zeros_like(back_u8)
+    for cid in range(1, n_cc):
+        if stats[cid, cv2.CC_STAT_AREA] >= 200:
+            back_clean[lab == cid] = 1
+    if int(back_clean.sum()) < 300:
+        return layers_map, depth_map, "后腔过小"
+
+    # Swallow dark/semi-transparent inner-cavity outer fringe (radius 6px) so zero hairline crosses the face
+    hw_lum = hw_c[..., :3].astype(np.float32).mean(axis=2)
+    k_rim = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    back_clean = ((back_clean > 0) | ((cv2.dilate(back_clean, k_rim) > 0) & (hw_a > 0) & ((hw_lum < 95.0) | (hw_a < 96)))).astype(np.uint8)
+    bm_src = np.where(hw_a == 0, 1.0, back_clean.astype(np.float32))
+    bm_f = cv2.GaussianBlur(bm_src, (0, 0), max(0.5, float(feather))) if feather > 0 else bm_src
+    bm_b = cv2.GaussianBlur(cv2.dilate(back_clean, k5).astype(np.float32), (0, 0), max(0.5, float(feather))) if feather > 0 else cv2.dilate(back_clean, k5).astype(np.float32)
+
+    hw_back = hw_c.copy()
+    hw_front = hw_c.copy()
+    hw_back[..., 3] = np.clip(np.round(hw_a.astype(np.float32) * bm_b), 0, 255).astype(np.uint8)
+    hw_front[..., 3] = np.clip(np.round(hw_a.astype(np.float32) * (1.0 - bm_f)), 0, 255).astype(np.uint8)
+    # Prune any tiny disconnected stray rim arcs (<600px) left in headwear_2 over the face
+    nf_cc, nf_lab, nf_stats, _ = cv2.connectedComponentsWithStats((hw_front[..., 3] > 0).astype(np.uint8), connectivity=8)
+    if nf_cc > 2:
+        max_f_cid = 1 + int(np.argmax(nf_stats[1:, cv2.CC_STAT_AREA]))
+        for cid in range(1, nf_cc):
+            if cid != max_f_cid and nf_stats[cid, cv2.CC_STAT_AREA] < 600:
+                comp = (nf_lab == cid)
+                if np.any(comp & fc_m):
+                    hw_front[comp, 3] = 0
+
+    del layers_map["headwear"]
+    layers_map["headwear_1"] = hw_back
+    layers_map["headwear_2"] = hw_front
+    depth_map["headwear_1"] = hwd.copy()
+    depth_map["headwear_2"] = hwd.copy()
+    return layers_map, depth_map, f"帽子三明治拆分(后腔={int(back_clean.sum())}px)"
 
 def _norm_role(tag):
     t = tag.lower().strip()
@@ -602,6 +673,10 @@ def sort_layers_by_mode(names, layers_map, depth_map, mode="auto"):
                 return (6.5, scores[n])
             if n == "topwear_2":
                 return (7.0, scores[n])
+            if n == "headwear_1":
+                return (9.5, scores[n])
+            if n == "headwear_2":
+                return (24.0, scores[n])
             sub = 0.2 if n.endswith("_2") else (-0.2 if n.endswith("_1") else 0.0)
             return (base + sub, -scores[n])
         return sorted(names, key=ckey)
@@ -697,6 +772,13 @@ def sort_layers_by_mode(names, layers_map, depth_map, mode="auto"):
             ensure_before("neck", "topwear_2")
             ensure_before("topwear_1", "neck")
 
+    # Lock headwear sandwich: headwear_1 (hat back/inner opening) < face < ... < front hair < headwear_2 (hat front brim)
+    if "headwear_1" in arr and "headwear_2" in arr:
+        for f_n in [x for x in arr if role_map[x] in ("ears", "face")]:
+            ensure_before("headwear_1", f_n)
+        for fg_n in [x for x in arr if role_map[x] in ("face", "front hair")]:
+            ensure_after("headwear_2", fg_n)
+
     # Mode-specific overrides
     if mode == "arms_front":
         for hw in [n for n in arr if role_map[n] == "handwear"]:
@@ -732,6 +814,7 @@ class StudioSession:
         self.depths = {}
         self.visible = {}
         self.undo_stack = []
+        self._cached_rois = None
 
     def load_psd_bytes(self, psd_bytes, filename="input.psd", depth_bytes=None):
         with self.lock:
@@ -777,6 +860,7 @@ class StudioSession:
         self.depths = {k: v.copy() for k, v in self.orig_depths.items()}
         self.visible = {k: True for k in self.order}
         self.undo_stack = []
+        self._cached_rois = None
 
     def _bbox_for_names(self, names, pad_ratio=0.35):
         xs_min, ys_min, xs_max, ys_max = self.W, self.H, 0, 0
@@ -807,39 +891,58 @@ class StudioSession:
         pad = max(48, int(max(bw, bh) * pad_ratio))
         return [max(0, xs_min - pad), max(0, ys_min - pad), min(self.W, xs_max + pad), min(self.H, ys_max + pad)]
 
-    def get_state(self):
+    def _refresh_rois_cache(self):
+        self._cached_rois = {
+            "full": [0, 0, self.W, self.H],
+            "face": self._bbox_for_names(["face", "eyewhite", "mouth", "front hair"], 0.25),
+            "neck": self._bbox_for_names(["neck"], 0.65),
+            "head": self._bbox_for_names(["headwear", "headwear_1", "headwear_2", "front hair", "face"], 0.20),
+            "torso": self._bbox_for_names(["topwear", "topwear_1", "topwear_2"], 0.15),
+        }
+
+    def get_state(self, recompute_rois=False):
+        if recompute_rois or not getattr(self, "_cached_rois", None):
+            self._refresh_rois_cache()
+        step = max(1, max(self.H, self.W) // 256)
+        area_mul = step * step
         info = []
         for name in self.order:
             c = self.layers[name]
-            a = c[..., 3]
-            ys, xs = np.nonzero(a > 16)
-            bbox = [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1] if len(ys) > 0 else [0, 0, self.W, self.H]
+            a_s = c[::step, ::step, 3]
+            m_s = a_s > 16
+            if np.any(m_s):
+                rows = np.any(m_s, axis=1)
+                cols = np.any(m_s, axis=0)
+                rh_s, rw_s = m_s.shape
+                y0 = int(np.argmax(rows)) * step
+                y1 = min(self.H, (rh_s - int(np.argmax(rows[::-1]))) * step)
+                x0 = int(np.argmax(cols)) * step
+                x1 = min(self.W, (rw_s - int(np.argmax(cols[::-1]))) * step)
+                bbox = [x0, y0, x1, y1]
+            else:
+                bbox = [0, 0, self.W, self.H]
             d = self.depths.get(name)
-            m = a > 16
-            d_med = round(float(np.median(d[m])), 3) if (d is not None and np.any(m)) else 0.5
-            d_std = round(float(np.std(d[m])), 4) if (d is not None and np.any(m)) else 0.0
+            if d is not None and np.any(m_s):
+                d_s = d[::step, ::step][m_s]
+                d_med = round(float(np.median(d_s)), 3)
+                d_std = round(float(np.std(d_s)), 4)
+            else:
+                d_med, d_std = 0.5, 0.0
             info.append({
                 "name": name,
                 "visible": self.visible.get(name, True),
-                "pixels": int((a > 10).sum()),
-                "haze_pixels": int(((a > 0) & (a <= 10)).sum()),
+                "pixels": int((a_s > 10).sum()) * area_mul,
+                "haze_pixels": int(((a_s > 0) & (a_s <= 10)).sum()) * area_mul,
                 "bbox": bbox,
                 "depth_median": d_med,
                 "has_depth_var": d_std > 0.005,
             })
-        rois = {
-            "full": [0, 0, self.W, self.H],
-            "face": self._bbox_for_names(["face", "eyewhite", "mouth", "front hair"], 0.25),
-            "neck": self._bbox_for_names(["neck"], 0.65),
-            "head": self._bbox_for_names(["headwear", "front hair", "face"], 0.20),
-            "torso": self._bbox_for_names(["topwear", "topwear_1", "topwear_2"], 0.15),
-        }
         return {
             "filename": self.filename,
             "width": self.W,
             "height": self.H,
             "layers": info,
-            "rois": rois,
+            "rois": self._cached_rois,
             "can_undo": len(self.undo_stack) > 0,
         }
 
@@ -897,6 +1000,7 @@ class StudioSession:
             return buf.getvalue()
 
     def apply_pipeline(self, params):
+        t0 = time.perf_counter()
         with self.lock:
             if self.W == 0:
                 return {"error": "请先加载 PSD 文件"}
@@ -931,6 +1035,19 @@ class StudioSession:
                 self.visible["topwear_1"] = True
                 self.visible["topwear_2"] = True
 
+            hw_sandwich = bool(params.get("headwear_sandwich", True))
+            self.layers, self.depths, hw_msg = refine_headwear_sandwich(
+                self.layers, self.depths, self.H, self.W,
+                enabled=hw_sandwich, depth_offset=depth_offset, feather=feather
+            )
+            if hw_msg not in ("跳过", "无重叠", "无需拆分", "无有效深度差"):
+                logs.append(f"头饰:{hw_msg}")
+            if "headwear_1" in self.layers and "headwear_2" in self.layers and "headwear" in self.order:
+                hi = self.order.index("headwear")
+                self.order[hi:hi+1] = ["headwear_1", "headwear_2"]
+                self.visible["headwear_1"] = True
+                self.visible["headwear_2"] = True
+
             if decontam > 0:
                 for name in list(self.order):
                     self.layers[name] = decontaminate_edges(self.layers[name], radius=decontam)
@@ -939,17 +1056,20 @@ class StudioSession:
             self.order = sort_layers_by_mode(self.order, self.layers, self.depths, mode=sort_mode)
             logs.append(f"排序:{sort_mode}")
 
-            st = self.get_state()
-            st["log"] = " | ".join(logs)
+            st = self.get_state(recompute_rois=True)
+            ms = int((time.perf_counter() - t0) * 1000)
+            st["log"] = " | ".join(logs) + f" ({ms} ms)"
             return st
 
     def apply_sort_only(self, sort_mode):
+        t0 = time.perf_counter()
         with self.lock:
             if self.W == 0:
                 return {"error": "请先加载 PSD 文件"}
             self.order = sort_layers_by_mode(self.order, self.layers, self.depths, mode=sort_mode)
             st = self.get_state()
-            st["log"] = f"已切换排序算法：{sort_mode}"
+            ms = int((time.perf_counter() - t0) * 1000)
+            st["log"] = f"已切换排序算法：{sort_mode} ({ms} ms)"
             return st
 
     def split_layer(self, name, threshold=None, feather=1.0):
@@ -1024,6 +1144,11 @@ SESSION = StudioSession()
 
 
 class StudioHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def address_string(self):
+        return self.client_address[0]
+
     def log_message(self, fmt, *args):
         pass
 
@@ -1062,7 +1187,7 @@ class StudioHandler(BaseHTTPRequestHandler):
                 parts = [int(v) for v in qs["crop"][0].split(",")]
                 if len(parts) == 4:
                     crop = parts
-            png = SESSION.render_composite_png(use_orig=use_orig, solo=solo, head_dx=hdx, head_dy=hdy, crop=crop)
+            png = SESSION.render_composite_png(use_orig=use_orig, solo=solo, head_dx=hdx, head_dy=hdy, crop=crop, max_dim=1024 if crop else 768)
             self._send_bytes(png, "image/png")
         elif u.path == "/api/export/psd":
             raw = SESSION.export_psd_bytes()

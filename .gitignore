@@ -15,11 +15,8 @@ workspace/*
 !workspace/*.ps1
 !workspace/*.txt
 !workspace/*.md
-!workspace/psd_studio_v2_1_fast_20261121_2050/
-workspace/psd_studio_v2_1_fast_20261121_2050/*
-!workspace/psd_studio_v2_1_fast_20261121_2050/psd_studio.py
-!workspace/psd_studio_v2_1_fast_20261121_2050/psd_studio.html
-!workspace/psd_studio_v2_1_fast_20261121_2050/start_studio_win.bat
+# psd_studio 只保留最新快照目录（含 CHANGELOG.md）
+!workspace/psd_studio*/
 
 # ── Python ────────────────────────────────────────────────────────
 __pycache__/

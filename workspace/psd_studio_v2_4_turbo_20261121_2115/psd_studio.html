@@ -178,6 +178,7 @@
       <div class="row"><label>深度微调偏移</label><input type="range" id="pDepthOff" min="-0.25" max="0.25" step="0.01" value="0"><span class="val" id="vDepthOff">0.00</span></div>
       <div class="row"><label>肤色色差阈值</label><input type="range" id="pSkinDiff" min="10" max="45" value="24"><span class="val" id="vSkinDiff">24</span></div>
       <div class="row"><label>边缘羽化</label><input type="range" id="pFeather" min="0" max="3" step="0.2" value="1.0"><span class="val" id="vFeather">1.0</span></div>
+      <div class="row"><label><input type="checkbox" id="pHwSandwich" checked> 帽子/头饰伪深度三明治拆分（防帽内腔挡脸）</label></div>
       <button class="btn primary" id="btnApply">应用全套 CV 处理与排序</button>
     </div>
 
@@ -442,6 +443,7 @@ $('btnApply').addEventListener('click', async () => {
     skin_diff: Number($('pSkinDiff').value),
     feather: Number($('pFeather').value),
     sort_mode: $('pSortMode').value,
+    headwear_sandwich: $('pHwSandwich').checked,
   });
   updateUI(st);
 });

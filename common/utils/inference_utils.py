@@ -889,6 +889,175 @@ def _clean_and_split_objects(tag2pinfo: dict, frame_size):
         tag2pinfo['objects'] = updated
 
 
+
+
+def _refine_neck_topwear_seam(tag2pinfo: dict, frame_size, fullpage=None):
+    """First-principles neck <-> topwear solver based on See-through (SIGGRAPH 2026) Sec. 4.2 & Local Layering:
+    1) Duplicated-skin cutout (fix1/fix7/t02): when `topwear` duplicates collarbone skin (`||neck - topwear|| < 24`),
+       cut out the redundant skin + top anti-aliased crop edge (`alpha 1..32`) so `neck` sits cleanly behind `topwear`.
+    2) Per-pixel pseudo-depth Sandwich Split (`D_topwear` vs `D_neck`, refined with `src_img` when available):
+       - In `see-through`, larger depth = farther behind.
+       - Compare per-pixel `td > nd` (topwear BEHIND neck: back inner collar / chair) vs `td <= nd` (topwear IN FRONT of neck: front collar).
+       - Only when BOTH strata genuinely exist (`>= 300 px` & `>= 10%` each, e.g. fix4/fix8/t01), split `topwear` into
+         `topwear_1` (behind neck, with 3px underlap) and `topwear_2` (in front of neck), yielding `topwear_1 < neck < topwear_2`.
+       - When `topwear` is >88% behind `neck` (fix5/t04/t05), leave unsplit and let local overlap depth keep `topwear < neck`.
+       - When `topwear` is >88% in front of `neck` (bunny_ears), leave unsplit and keep `neck < topwear`."""
+    if 'neck' not in tag2pinfo or 'topwear' not in tag2pinfo:
+        return
+    H, W = int(frame_size[0]), int(frame_size[1])
+    nk = tag2pinfo['neck']
+    tw = tag2pinfo['topwear']
+    n_img, n_dep = _part_to_full_canvas(nk, H, W)
+    t_img, t_dep = _part_to_full_canvas(tw, H, W)
+    n_a = n_img[..., 3]
+    t_a = t_img[..., 3]
+    nm = n_a > 24
+    tm = t_a > 24
+    ov = nm & tm
+    ov_cnt = int(ov.sum())
+    if ov_cnt < 200:
+        return
+
+    n_rgb = n_img[..., :3].astype(np.float32)
+    t_rgb = t_img[..., :3].astype(np.float32)
+    diff_mean = np.abs(n_rgb - t_rgb).mean(axis=2)
+    diff_max = np.abs(n_rgb - t_rgb).max(axis=2)
+    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+    # --- Step 1: Duplicated-skin opening cutout (fix1, fix7, t02) ---
+    # Skip if topwear is a full-wall background covering >35% of face (e.g. fix2)
+    tw_is_bg = False
+    if 'face' in tag2pinfo:
+        f_img, _ = _part_to_full_canvas(tag2pinfo['face'], H, W)
+        fm = f_img[..., 3] > 24
+        if int((tm & fm).sum()) > 0.35 * max(1, int(fm.sum())):
+            tw_is_bg = True
+
+    skin_ov = ov & (diff_mean < 24.0) & (diff_max < 38.0)
+    skin_clean = cv2.morphologyEx(skin_ov.astype(np.uint8), cv2.MORPH_OPEN, k5)
+    n_cc, cc_lab, stats, _ = cv2.connectedComponentsWithStats(skin_clean, connectivity=8)
+    skin_main = np.zeros_like(skin_clean)
+    for cid in range(1, n_cc):
+        if stats[cid, cv2.CC_STAT_AREA] >= 500:
+            skin_main[cc_lab == cid] = 1
+    if (not tw_is_bg) and int(skin_main.sum()) >= 500:
+        # Remove duplicated collarbone skin + top anti-aliased horizontal crop line (alpha 1..32)
+        k_down = np.zeros((25, 1), dtype=np.uint8)
+        k_down[:13, 0] = 1
+        top_band = (cv2.dilate((t_a <= 16).astype(np.uint8), k_down) > 0) & (t_a > 0)
+        k_up = np.zeros((25, 5), dtype=np.uint8)
+        k_up[12:, :] = 1
+        skin_up = (cv2.dilate(skin_main, k_up) > 0) & top_band & (n_a > 0)
+        skin_cut = (skin_main > 0) | skin_up
+        keep_t = cv2.GaussianBlur(np.where(skin_cut, 0.0, 1.0).astype(np.float32), (0, 0), 1.0)
+        t_front = t_img.copy()
+        t_front[..., 3] = np.clip(np.round(t_a.astype(np.float32) * keep_t), 0, 255).astype(np.uint8)
+        upd_t = _make_split_part_from_rgba('topwear', t_front, t_dep)
+        if upd_t is not None:
+            upd_t['depth_median'] = min(float(tw.get('depth_median', 0.5)), float(nk.get('depth_median', 0.5)) - 0.01)
+            upd_t['_skin_cut'] = True
+            tag2pinfo['topwear'] = upd_t
+        return
+
+    # --- Step 2: Per-pixel pseudo-depth Sandwich Split (D_topwear vs D_neck) ---
+    # Check that real non-constant per-pixel depth is present on topwear
+    td_ov = t_dep[ov]
+    nd_ov = n_dep[ov]
+    has_real_depth = (float(np.std(t_dep[tm])) > 1e-3) and (float(np.std(td_ov)) > 1e-3)
+
+    behind_ov = np.zeros((H, W), dtype=bool)
+    front_ov = np.zeros((H, W), dtype=bool)
+
+    if has_real_depth:
+        # In see-through pseudo-depth: LARGER depth = FARTHER behind camera.
+        behind_ov = ov & (t_dep > n_dep)
+        front_ov = ov & (t_dep <= n_dep)
+        # If fullpage (src_img) is also available, let unoccluded src_img residuals veto obvious depth errors
+        if fullpage is not None and fullpage.shape[0] == H and fullpage.shape[1] == W:
+            src_rgb = fullpage[..., :3].astype(np.float32)
+            err_n = np.abs(n_rgb - src_rgb).mean(axis=2)
+            err_t = np.abs(t_rgb - src_rgb).mean(axis=2)
+            unocc = np.minimum(err_n, err_t) < 22.0
+            src_behind = ov & unocc & (err_n + 14.0 < err_t)
+            src_front = ov & unocc & (err_t + 14.0 < err_n)
+            behind_ov = (behind_ov & (~src_front)) | src_behind
+            front_ov = (front_ov & (~src_behind)) | src_front
+    elif fullpage is not None and fullpage.shape[0] == H and fullpage.shape[1] == W:
+        # No real depth, but src_img ground truth is available
+        src_rgb = fullpage[..., :3].astype(np.float32)
+        err_n = np.abs(n_rgb - src_rgb).mean(axis=2)
+        err_t = np.abs(t_rgb - src_rgb).mean(axis=2)
+        unocc = np.minimum(err_n, err_t) < 24.0
+        behind_ov = ov & unocc & (err_n + 10.0 < err_t)
+        front_ov = ov & unocc & (err_t + 10.0 < err_n)
+    else:
+        # Offline PSD with neither real depth nor src_img -> stay conservative, do NOT guess RGB!
+        return
+
+    b_cnt = int(behind_ov.sum())
+    f_cnt = int(front_ov.sum())
+    b_frac = b_cnt / max(1, ov_cnt)
+    f_frac = f_cnt / max(1, ov_cnt)
+
+    # True Sandwich check: BOTH behind-neck and front-of-neck strata must be significant!
+    if b_cnt >= 300 and f_cnt >= 300 and b_frac >= 0.10 and f_frac >= 0.10:
+        nk_d_med = float(np.median(nd_ov))
+        # Start from behind_ov inside overlap, plus any topwear pixels directly adjacent above/around neck
+        # that are ALSO deeper than neck (e.g., chair/back-collar rim extending slightly outside neck x-span!)
+        ys_n, xs_n = np.nonzero(nm)
+        ny0, ny1 = int(ys_n.min()), int(ys_n.max()) + 1
+        nx0, nx1 = int(xs_n.min()), int(xs_n.max()) + 1
+        pad_x = max(12, int((nx1 - nx0) * 0.15))
+
+        back_cand = behind_ov.copy()
+        if has_real_depth:
+            # Include deeper topwear pixels strictly within the expanded neck column and above front_ov's bottom
+            col_roi = np.zeros((H, W), dtype=bool)
+            col_roi[:ny1, max(0, nx0 - pad_x):min(W, nx1 + pad_x)] = True
+            # Keep only connected component(s) of (tm & col_roi & (t_dep > nk_d_med)) touching behind_ov
+            ext_cand = (tm & col_roi & (t_dep > nk_d_med)) | behind_ov
+            n_cc, cc_lab, stats, _ = cv2.connectedComponentsWithStats(ext_cand.astype(np.uint8), connectivity=8)
+            back_mask = np.zeros((H, W), dtype=np.uint8)
+            for cid in range(1, n_cc):
+                comp = (cc_lab == cid)
+                if stats[cid, cv2.CC_STAT_AREA] >= 150 and int((comp & behind_ov).sum()) >= 100:
+                    back_mask[comp] = 1
+        else:
+            back_mask = behind_ov.astype(np.uint8)
+
+        if int(back_mask.sum()) < 300:
+            return
+
+        # Clean small holes & catch top anti-aliased back-collar outline (alpha 1..32)
+        back_mask = cv2.morphologyEx(back_mask, cv2.MORPH_CLOSE, k5)
+        k_down8 = np.zeros((17, 1), dtype=np.uint8)
+        k_down8[:9, 0] = 1
+        top_rim_band = (cv2.dilate((t_a <= 16).astype(np.uint8), k_down8) > 0) & (t_a > 0)
+        k_up8 = np.zeros((17, 3), dtype=np.uint8)
+        k_up8[8:, :] = 1
+        back_up = (cv2.dilate(back_mask, k_up8) > 0) & top_rim_band
+        back_final = ((back_mask > 0) | back_up) & (t_a > 0)
+
+        # Edge-aware alpha feather (1.0px Gaussian) + 3px back-layer underlap so rigging has zero gap
+        bm_u8 = back_final.astype(np.uint8)
+        bm_f = cv2.GaussianBlur(bm_u8.astype(np.float32), (0, 0), 1.0)
+        bm_back = cv2.GaussianBlur(cv2.dilate(bm_u8, k5).astype(np.float32), (0, 0), 1.0)
+
+        t_back = t_img.copy()
+        t_front = t_img.copy()
+        t_back[..., 3] = np.clip(np.round(t_a.astype(np.float32) * bm_back), 0, 255).astype(np.uint8)
+        t_front[..., 3] = np.clip(np.round(t_a.astype(np.float32) * (1.0 - bm_f)), 0, 255).astype(np.uint8)
+
+        p_back = _make_split_part_from_rgba('topwear_1', t_back, t_dep)
+        p_front = _make_split_part_from_rgba('topwear_2', t_front, t_dep)
+        if p_back is not None and p_front is not None:
+            nd_val = float(nk.get('depth_median', nk_d_med))
+            p_back['depth_median'] = nd_val + 0.02   # farther -> behind neck
+            p_front['depth_median'] = nd_val - 0.02  # closer  -> in front of neck
+            del tag2pinfo['topwear']
+            tag2pinfo['topwear_1'] = p_back
+            tag2pinfo['topwear_2'] = p_front
+
 def _sort_parts_by_local_overlap(part_dict_list: list, frame_size, fullpage=None):
     """Ground-truth src_img residual verification + local overlap-region depth sorting,
     with strict anatomical face/eye/garment invariants."""
@@ -983,7 +1152,7 @@ def _sort_parts_by_local_overlap(part_dict_list: list, frame_size, fullpage=None
         'eyewhite': 2, 'irides': 3, 'eyelash': 4, 'eyebrow': 4, 'eyewear': 5, 'headwear': 5,
     }
     above_face = {'front hair', 'side hair', 'ahoge'}
-    below_face = {'back hair', 'neck', 'ears'}
+    below_face = {'back hair', 'neck', 'ears', 'topwear'}
     guard = len(arr) * len(arr)
     changed = True
     while changed and guard > 0:
@@ -1014,6 +1183,43 @@ def _sort_parts_by_local_overlap(part_dict_list: list, frame_size, fullpage=None
                     break
             if changed:
                 break
+
+    # 4. Final lock for back-hair & neck <-> topwear collar topology:
+    #    back hair / back hair_1 < topwear_1 (back collar/chair) < neck < topwear / topwear_2 (front collar) < face
+    # Runs AFTER face/eye stack lock so all remain strictly below `face` & `front hair`.
+    def _ensure_before(a_tag, b_tag):
+        t_idx = {x['tag']: k for k, x in enumerate(arr)}
+        if a_tag in t_idx and b_tag in t_idx and t_idx[a_tag] > t_idx[b_tag]:
+            p = arr.pop(t_idx[a_tag])
+            bi = next(k for k, x in enumerate(arr) if x['tag'] == b_tag)
+            arr.insert(bi, p)
+
+    # Detect if unsplit `topwear` is actually a full-wall background (covers >35% of face, e.g. fix2)
+    tw_is_bg = (
+        'topwear' in full_m and 'face' in full_m
+        and int((full_m['topwear'] & full_m['face']).sum()) > 0.35 * max(1, int(full_m['face'].sum()))
+    )
+
+    # Keep true back hair (unsplit `back hair` or `back hair_1`, NOT front-draped `back hair_2`) behind neck & real topwear
+    fg_targets = ('topwear_1', 'neck', 'topwear_2') if tw_is_bg else ('topwear_1', 'neck', 'topwear', 'topwear_2')
+    for bh_tag in ('back hair', 'back hair_1'):
+        for fg_tag in fg_targets:
+            _ensure_before(bh_tag, fg_tag)
+
+    if tw_is_bg:
+        # Unsplit background-baked topwear stays behind neck & back hair
+        for fg_tag in ('back hair', 'back hair_1', 'neck'):
+            _ensure_before('topwear', fg_tag)
+    else:
+        # Only enforce `topwear_1 < neck < topwear_2` when split, or `neck < topwear` when duplicated skin was cut out.
+        # Otherwise, respect local overlap pseudo-depth (so fix5/t04/t05 keep `topwear < neck` naturally!).
+        t_idx = {x['tag']: k for k, x in enumerate(arr)}
+        if 'neck' in t_idx:
+            if 'topwear_1' in t_idx and 'topwear_2' in t_idx:
+                _ensure_before('neck', 'topwear_2')
+                _ensure_before('topwear_1', 'neck')
+            elif 'topwear' in t_idx and arr[t_idx['topwear']].get('_skin_cut', False):
+                _ensure_before('neck', 'topwear')
 
     return arr
 
@@ -1104,6 +1310,7 @@ def further_extr(srcd: str, rotate=True, save_to_psd=False, tblr_split=True):
     _depth_split_bimodal_parts(tag2pinfo, fullpage.shape[:2])
     _clean_and_split_objects(tag2pinfo, fullpage.shape[:2])
     _fill_head_interior_gaps(tag2pinfo, fullpage.shape[:2])
+    _refine_neck_topwear_seam(tag2pinfo, fullpage.shape[:2], fullpage=fullpage)
 
     # Plan C: edge RGB decontamination (eliminates dark/gray halos on transparent fringes)
     for _pdict in tag2pinfo.values():

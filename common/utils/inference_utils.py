@@ -597,6 +597,23 @@ def _decontaminate_edges(img: np.ndarray) -> np.ndarray:
         return img
 
 
+def _get_depth_median(pinfo: dict, default: float = 0.5) -> float:
+    """Safely return (and lazily cache) depth_median for a part dict that may only have img/depth/xyxy."""
+    if pinfo is None:
+        return float(default)
+    dm = pinfo.get('depth_median')
+    if dm is not None:
+        return float(dm)
+    dep = pinfo.get('depth')
+    img = pinfo.get('img')
+    if dep is not None and img is not None:
+        m = img[..., 3] > 16
+        val = float(np.median(dep[m])) if np.any(m) else (float(np.median(dep)) if dep.size > 0 else float(default))
+        pinfo['depth_median'] = val
+        return val
+    return float(default)
+
+
 def _depth_split_bimodal_parts(tag2pinfo: dict, frame_size, use_lama: bool = False):
     """Split handwear (disconnected & connected arms) and back hair along depth cliffs vs topwear,
     using RGB Guided Filter edge snapping + back-layer underlap inpainting."""
@@ -710,7 +727,7 @@ def _depth_split_bimodal_parts(tag2pinfo: dict, frame_size, use_lama: bool = Fal
                         p_back_h['depth_median'] = max(p_back_h['depth_median'], tw_med + 0.015)
                         p_front_h['depth_median'] = min(p_front_h['depth_median'], tw_med - 0.015)
                         if 'face' in tag2pinfo:
-                            p_front_h['depth_median'] = max(p_front_h['depth_median'], float(tag2pinfo['face']['depth_median']) + 0.002)
+                            p_front_h['depth_median'] = max(_get_depth_median(p_front_h), _get_depth_median(tag2pinfo['face']) + 0.002)
                         tag2pinfo.pop('back hair')
                         tag2pinfo['back hair_1'] = p_back_h
                         tag2pinfo['back hair_2'] = p_front_h
@@ -809,7 +826,7 @@ def _fill_head_interior_gaps(tag2pinfo: dict, frame_size):
     bh_img[y1:y2, x1:x2, 3] = np.maximum(bh_img[y1:y2, x1:x2, 3], np.clip(np.round(hole_a), 0, 255).astype(np.uint8))
     updated = _make_split_part_from_rgba(bh_key, bh_img, bh_dep)
     if updated is not None:
-        updated['depth_median'] = tag2pinfo[bh_key]['depth_median']
+        updated['depth_median'] = _get_depth_median(tag2pinfo[bh_key])
         tag2pinfo[bh_key] = updated
 
 
@@ -875,7 +892,7 @@ def _clean_and_split_objects(tag2pinfo: dict, frame_size):
                         p_bg = _make_split_part_from_rgba('objects_1', bg_rgba, obj_dep)
                         p_fg = _make_split_part_from_rgba('objects_2', fg_rgba, obj_dep)
                         if p_bg is not None and p_fg is not None:
-                            hw_min = min(float(tag2pinfo[hk]['depth_median']) for hk in hw_keys)
+                            hw_min = min(_get_depth_median(tag2pinfo[hk]) for hk in hw_keys)
                             p_fg['depth_median'] = min(p_fg['depth_median'], hw_min - 0.01)
                             p_bg['depth_median'] = max(p_bg['depth_median'], hw_min + 0.02)
                             tag2pinfo.pop('objects')
@@ -885,7 +902,7 @@ def _clean_and_split_objects(tag2pinfo: dict, frame_size):
 
     updated = _make_split_part_from_rgba('objects', obj_img, obj_dep)
     if updated is not None:
-        updated['depth_median'] = obj['depth_median']
+        updated['depth_median'] = _get_depth_median(obj)
         tag2pinfo['objects'] = updated
 
 
@@ -954,7 +971,7 @@ def _refine_neck_topwear_seam(tag2pinfo: dict, frame_size, fullpage=None):
         t_front[..., 3] = np.clip(np.round(t_a.astype(np.float32) * keep_t), 0, 255).astype(np.uint8)
         upd_t = _make_split_part_from_rgba('topwear', t_front, t_dep)
         if upd_t is not None:
-            upd_t['depth_median'] = min(float(tw.get('depth_median', 0.5)), float(nk.get('depth_median', 0.5)) - 0.01)
+            upd_t['depth_median'] = min(_get_depth_median(tw), _get_depth_median(nk) - 0.01)
             upd_t['_skin_cut'] = True
             tag2pinfo['topwear'] = upd_t
         return
@@ -1051,7 +1068,7 @@ def _refine_neck_topwear_seam(tag2pinfo: dict, frame_size, fullpage=None):
         p_back = _make_split_part_from_rgba('topwear_1', t_back, t_dep)
         p_front = _make_split_part_from_rgba('topwear_2', t_front, t_dep)
         if p_back is not None and p_front is not None:
-            nd_val = float(nk.get('depth_median', nk_d_med))
+            nd_val = _get_depth_median(nk, nk_d_med)
             p_back['depth_median'] = nd_val + 0.02   # farther -> behind neck
             p_front['depth_median'] = nd_val - 0.02  # closer  -> in front of neck
             del tag2pinfo['topwear']
@@ -1306,6 +1323,9 @@ def further_extr(srcd: str, rotate=True, save_to_psd=False, tblr_split=True):
     if 'eyelash' in tag2pinfo and 'face' in tag2pinfo:
         _clean_eyelash_skin_fringe(tag2pinfo['eyelash'], tag2pinfo['face'])
 
+    # Plan C: ensure every part has cached depth_median before splitting/refining
+    for _pdict in tag2pinfo.values():
+        _get_depth_median(_pdict)
     # Plan C: depth-cliff split (Guided Filter edge snapping + back-layer underlap inpaint)
     _depth_split_bimodal_parts(tag2pinfo, fullpage.shape[:2])
     _clean_and_split_objects(tag2pinfo, fullpage.shape[:2])
@@ -1331,15 +1351,15 @@ def further_extr(srcd: str, rotate=True, save_to_psd=False, tblr_split=True):
             part_dict_list.append(part_dict)
 
     if 'face' in tag2pinfo:
-        fd = float(tag2pinfo['face']['depth_median'])
+        fd = _get_depth_median(tag2pinfo['face'])
         for idx_t, t in enumerate(['nose', 'mouth', 'eyes', 'eyewhite', 'irides', 'eyelash', 'eyebrow', 'headwear']):
             if t in tag2pinfo:
                 target_max = fd - 0.001 * (idx_t + 1)
-                if tag2pinfo[t]['depth_median'] > target_max:
+                if _get_depth_median(tag2pinfo[t]) > target_max:
                     tag2pinfo[t]['depth_median'] = target_max
         for t in ['earr', 'earl', 'ears']:
             if t in tag2pinfo:
-                tag2pinfo[t]['depth_median'] = tag2pinfo['face']['depth_median'] + 0.001
+                tag2pinfo[t]['depth_median'] = _get_depth_median(tag2pinfo['face']) + 0.001
 
     # if 'hairb' in tag2pinfo:
     #     tag2pinfo['hairb']['depth_median'] = 1.
